@@ -1,0 +1,5 @@
+#!/bin/bash
+export ANDROID_HOME=/opt/android-sdk
+export GRADLE_OPTS="-Dorg.gradle.native.dir=/opt/gradle/gradle-8.5/native"
+export GRADLE_USER_HOME=/tmp/.gradle
+exec /opt/gradle/gradle-8.5/bin/gradle "$@"

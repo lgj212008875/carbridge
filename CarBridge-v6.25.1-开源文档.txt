@@ -1,0 +1,4482 @@
+╔══════════════════════════════════════════════════════════════╗
+║   CarBridge v6.25.1 — 开源完整源码文档 (MIT License)          ║
+║   生成: 2026-06-22 | 架构: 三端分离 OBD 仪表盘                 ║
+╚══════════════════════════════════════════════════════════════╝
+
+目录
+════
+一、项目概览与开源说明
+二、VPS 服务端 (8 JS)
+三、CarAgent 车机端 (Kotlin + XML)
+四、ObdRelay 手机端 (Kotlin + XML)
+五、编译构建配置
+六、部署教程
+七、API 接口速查
+八、v6.25.1 修正清单
+
+═══════════════════════════════════════════════════════════════
+一、项目概览与开源说明
+═══════════════════════════════════════════════════════════════
+
+CarBridge = 车载 OBD 实时仪表盘，三端分离架构：
+
+  ObdRelay(手机) ──raw hex──▶ VPS(自建) ──JSON──▶ CarAgent(车机)
+  ELM327蓝牙转发      解析/存储/计算    200ms轮询纯显示
+
+硬件: ELM327蓝牙 + Android手机 + Android车机 + Linux VPS
+协议: OBD-II KWP2000 Fast Init (协议5)
+
+━━━ MIT License ━━━
+可自由使用、修改、分发，保留版权声明。
+
+━━━ 部署指引 ━━━
+搜索 YOUR_ 即可找到所有需配置的占位符：
+  YOUR_VPS_IP             → 你的 VPS IP
+  YOUR_CARBRIDGE_API_KEY  → API 密钥 (需和服务端一致)
+  YOUR_ELM327_MAC_ADDRESS → ELM327 蓝牙 MAC
+  YOUR_KEYSTORE_PATH      → Android keystore 路径
+
+━━━ v6.25.1 修正清单 (vs v6.24) ━━━
+[VPS]
+  · || → ?? : engineRpm/coolantTemp/engineLoad/fuelPer100km/fuelLevel/carNotify
+  · fuelLevel ?? null 兜底
+  · _ecuSnapshot 始终返回字段
+[CarAgent]
+  · P0: onDestroy lateinit isInitialized 守卫
+  · P0: handler.post isFinishing/isDestroyed 判断
+  · P1: 农历年份范围校验 (1900-2100)
+  · P1: Thread{} → CachedThreadPool (全项目零裸线程)
+  · P2: removeCallbacksAndMessages(null) 防泄漏
+  · P2: updateNotification !isRunning 守卫
+  · 新增: 旧HTTP连接自动cancel
+  · 车速居中、去分隔线、农历+公历秒
+[ObdRelay]
+  · httpFireAndForget 复用 httpExecutor
+
+
+──────────────────────────────────────────────────────────
+文件: carbridge/server.js
+──────────────────────────────────────────────────────────
+// CarBridge v6.25.1 — 车机推送中转服务 入口
+// =========================================
+// HTTP 路由分发、鉴权、统一错误处理
+// v6.25.1: 移除 push.js, 微信推送由 OpenClaw cron 负责
+
+const http = require('http');
+const url = require('url');
+const config = require('./config');
+const { logInfo, logWarn } = require('./logger');
+const storage = require('./storage');
+const { handleStatus, handleStart, handleEnd, handleObd,
+        handleAlert, handleDiag, getTripsForPeriod, startTripTimeoutChecker,
+        calcRange, rollingAvgFuelPer100km,
+        getTripDuration, refuel, calibratedFuelLevel } = require('./trip');
+const { fetchFuelPrice, handleCalibration } = require('./fuel');
+const { beijingDateStr, beijingHour, isNightNow } = require('./geo');
+
+// ====== HTTP 服务 ======
+
+const server = http.createServer((req, res) => {
+  const parsed = url.parse(req.url, true);
+  const routePath = parsed.pathname;
+  const authOk = parsed.query.key === config.PUSH_KEY;
+
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  // 鉴权（/health /api/query/pid_config /api/query/pid_scan /api/query/ui_config /api/query/state 跳过）
+  if (!authOk && routePath !== '/health' && routePath !== '/api/query/pid_config' && routePath !== '/api/query/pid_scan' && routePath !== '/api/query/ui_config' && routePath !== '/api/query/state') {
+    logWarn('Auth 401', routePath + ' key=***');
+    res.writeHead(401); res.end('Unauthorized'); return;
+  }
+
+  // 请求体读取（限制大小）
+  let body = '', bodyLen = 0;
+  let destroyed = false;
+  req.on('data', chunk => {
+    bodyLen += chunk.length;
+    if (bodyLen > config.MAX_BODY) {
+      if (!destroyed) {
+        destroyed = true;
+        json(res, 413, { error: 'Payload too large' });
+      }
+      req.destroy(); return;
+    }
+    body += chunk;
+  });
+
+  req.on('end', () => {
+    if (destroyed) return;
+    route(routePath, body, req, res).catch(e => {
+      logWarn('HTTP ERR', e.message);
+      try { json(res, 500, { error: e.message }); } catch(_) {}
+    });
+  });
+});
+
+// ====== 辅助: 统计日/月/年里程和油费 ======
+
+function getDailyStats() {
+  const today = beijingDateStr();
+  const trips = getTripsForPeriod(today, 'day');
+  let km = 0, fuel = 0;
+  for (const t of trips) { km += t.mileage || 0; fuel += t.fuelUsed || 0; }
+  // 累加当前进行中的行程 (未结束的行程不在 tripHistory 中)
+  const cur = getCurrentTripDelta();
+  km += cur.km; fuel += cur.fuel;
+  return { km: Math.round(km * 100) / 100, fuel: Math.round(fuel * 100) / 100,
+           cost: Math.round(fuel * storage.fuelState.price * 100) / 100 };
+}
+
+function getMonthlyStats() {
+  const bjNow = new Date(Date.now() + 8 * 3600_000);
+  const month = bjNow.getFullYear() + '-' + String(bjNow.getMonth() + 1).padStart(2, '0');
+  const trips = getTripsForPeriod(month, 'month');
+  let km = 0, fuel = 0;
+  for (const t of trips) { km += t.mileage || 0; fuel += t.fuelUsed || 0; }
+  // 累加当前进行中的行程
+  const cur = getCurrentTripDelta();
+  km += cur.km; fuel += cur.fuel;
+  return { km: Math.round(km * 100) / 100, fuel: Math.round(fuel * 100) / 100,
+           cost: Math.round(fuel * storage.fuelState.price * 100) / 100 };
+}
+
+// 当前活跃行程的里程与油耗增量
+function getCurrentTripDelta() {
+  const trip = storage.currentTrip;
+  if (!trip.startTime) return { km: 0, fuel: 0 };
+  const km = trip.liveDistanceKm || 0;
+  const fuel = Math.max(0, (storage.carState.fuelConsumption || 0) - (trip.fuelStart || 0));
+  return { km, fuel };
+}
+
+function getTripFuelCost() {
+  // 本次行程油耗费用 = 行程开始后消耗的燃油 × 油价
+  const trip = storage.currentTrip;
+  if (!trip.startTime) return 0;
+  const fuelCons = storage.carState.fuelConsumption || 0;
+  const fuelStart = trip.fuelStart || 0;
+  const tripFuel = Math.max(0, fuelCons - fuelStart);
+  return Math.round(tripFuel * storage.fuelState.price * 100) / 100;
+}
+
+// 加到满需要的费用
+function getFillUpCost() {
+  const fuelLvl = storage.carState.fuelLevel;
+  if (fuelLvl == null || fuelLvl >= 100) return 0;
+  const remainingPct = (100 - fuelLvl) / 100;
+  return Math.round(remainingPct * config.TANK_CAPACITY * storage.fuelState.price * 100) / 100;
+}
+
+// ====== 路由分发 ======
+
+async function route(routePath, body, req, res) {
+  let result;
+
+  switch (routePath) {
+    case '/api/car/status':
+      result = handleStatus(body);
+      break;
+    case '/api/car/start':
+      result = await handleStart(body);
+      break;
+    case '/api/car/end':
+      result = await handleEnd(body);
+      break;
+    case '/api/car/alert':
+      result = handleAlert(body);
+      break;
+    case '/api/car/diag':
+      result = handleDiag(body);
+      break;
+    case '/api/car/obd':
+      result = handleObd(body);
+      break;
+    case '/api/car/calibration':
+      result = handleCalibration(body);
+      break;
+    case '/api/car/refuel':
+      result = refuel();
+      break;
+
+    // --- 查询接口 ---
+    case '/api/query/state': {
+      const od = storage.carState.obdData || {};
+      const daily = getDailyStats();
+      const monthly = getMonthlyStats();
+      const fuelLvl = storage.carState.fuelLevel;  // 由累计油耗反推
+      const avgFuel = rollingAvgFuelPer100km();
+      const resp = {
+        // 行程状态
+        inTrip: !!storage.currentTrip.startTime,
+        tripStartedAt: storage.currentTrip.startTime
+          ? new Date(storage.currentTrip.startTime).getTime() : 0,
+        // 仪表盘 10 项（全部 ?? null 确保 0 不被吞、字段永不缺失）
+        engineRpm: storage.carState.engineRpm ?? null,
+        obdSpeed: storage.carState.obdSpeed ?? storage.carState.obdData?.obdSpeed ?? 0,
+        coolantTemp: storage.carState.coolantTemp ?? null,
+        engineLoad: storage.carState.obdData?.engineLoad ?? null,
+        fuelPer100km: storage.carState.fuelPer100km ?? null,
+        fuelLevel: fuelLvl ?? null,
+        remainingRange: (() => { if (fuelLvl == null) return null; const r = calcRange(fuelLvl, avgFuel); return r != null ? Math.round(r) : null; })(),
+        tripDistanceKm: Math.round((storage.currentTrip.liveDistanceKm || 0) * 100) / 100,
+        tripDuration: getTripDuration(),
+        tripFuelCost: getTripFuelCost(),
+        fillUpCost: getFillUpCost(),
+        dailyDistanceKm: daily.km,
+        dailyFuelCost: daily.cost,
+        monthlyDistanceKm: monthly.km,
+        monthlyFuelCost: monthly.cost,
+        fuelPrice: storage.fuelState.price,
+        carNotify: storage.carState._carNotify ?? null,
+        isNight: isNightNow(storage.carState.lat, storage.carState.lng)
+      };
+      if (storage.carState._carNotify) delete storage.carState._carNotify;
+      // ECU 断开快照 — 始终带上字段（null 表示无断连记录）
+      resp._ecuSnapshot = storage._ecuSnapshot ?? null;
+      json(res, 200, resp);
+      return;
+    }
+    case '/api/query/trips': {
+      const limit = parseInt(url.parse(req.url, true).query.limit) || 5;
+      json(res, 200, { ok: true, data: storage.tripHistory.slice(-limit) });
+      return;
+    }
+    case '/api/query/current':
+      json(res, 200, { ok: true,
+        inTrip: !!storage.currentTrip.startTime,
+        data: storage.currentTrip });
+      return;
+    case '/api/query/pid_scan': {
+      // 扫描报告: 哪些 PID 有数据, 哪些返回 7F
+      const scan = storage.carState._pidScan || {};
+      json(res, 200, { ok: true, scan });
+      return;
+    }
+    case '/api/query/pid_config': {
+      json(res, 200, { pids: config.SCAN_PID_LIST });
+      return;
+    }
+    case '/api/query/ui_config': {
+      json(res, 200, config.DASHBOARD);
+      return;
+    }
+    case '/api/query/stats':
+      // 返回日/周/月/年统计（供 OpenClaw 生成微信推送）
+      json(res, 200, {
+        ok: true,
+        daily: storage.tripStats.daily,
+        weekly: storage.tripStats.weekly,
+        monthly: storage.tripStats.monthly,
+        yearly: storage.tripStats.yearly,
+        fuelPrice: storage.fuelState.price,
+        tripsToday: getTripsForPeriod(beijingDateStr(), 'day')
+      });
+      return;
+
+    // --- 健康检查 ---
+    case '/health': {
+      const mem = process.memoryUsage();
+      json(res, 200, {
+        status: 'ok',
+        version: config.VERSION,
+        uptime: process.uptime().toFixed(0),
+        memoryMB: (mem.heapUsed / 1024 / 1024).toFixed(1),
+        totalTrips: storage.tripHistory.length,
+        fuelPrice: storage.fuelState.price
+      });
+      return;
+    }
+
+    default:
+      json(res, 404, { error: 'Not found' });
+      return;
+  }
+
+  if (result) json(res, result.statusCode, result.body);
+}
+
+// ====== 辅助函数 ======
+
+function json(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+
+// ====== 启动 ======
+
+storage.loadData();
+startTripTimeoutChecker();
+
+// 油价定时刷新（每 6 小时）
+setInterval(() => {
+  if (storage.fuelState.city) fetchFuelPrice(storage.fuelState.city);
+}, 6 * 3600_000);
+
+// 启动 HTTP 服务
+server.listen(config.PORT, '0.0.0.0', () => {
+  console.log(`🚗 CarBridge v6.25.1 | Port: ${config.PORT} | Data: ${config.DATA_DIR}`);
+});
+
+// ====== 优雅退出 ======
+process.on('SIGTERM', () => { storage.saveDataSync(); process.exit(0); });
+process.on('SIGINT', () => { storage.saveDataSync(); process.exit(0); });
+process.on('uncaughtException', (err) => {
+  logWarn('uncaughtException', err.message);
+  storage.saveDataSync();
+  process.exit(1);
+});
+
+──────────────────────────────────────────────────────────
+文件: carbridge/config.js
+──────────────────────────────────────────────────────────
+// CarBridge v6.25.1 — 配置常量 (MIT License)
+// ==============================
+// 所有环境相关参数集中管理，方便部署迁移
+
+const path = require('path');
+
+module.exports = {
+  VERSION: '6.25.1',
+
+  // --- 服务 ---
+  PORT: 8899,
+
+  // --- API Key（支持环境变量覆盖） ---
+  // export CARBRIDGE_PUSH_KEY=***
+  PUSH_KEY: process.env.CARBRIDGE_PUSH_KEY || 'YOUR_CARBRIDGE_API_KEY',
+  // export CARBRIDGE_SCT_KEY=***
+  SCT_KEY: process.env.CARBRIDGE_SCT_KEY || 'YOUR_SERVERCHAN_KEY_IF_USED',
+
+  // --- 目录 (开源版使用相对路径, 部署时可通过环境变量覆盖) ---
+  DATA_DIR: process.env.CARBRIDGE_DATA_DIR || path.join(__dirname, 'data'),
+  LOG_DIR: process.env.CARBRIDGE_LOG_DIR || path.join(__dirname, 'logs'),
+  DIAG_DIR: path.join(process.env.CARBRIDGE_LOG_DIR || path.join(__dirname, 'logs'), 'diag'),
+
+  // --- 车况参数 ---
+  TANK_CAPACITY: 50,               // 油箱容量 (升)
+  DISPLACEMENT_L: 1.6,             // 发动机排量 (升)
+  FUEL_CALIB_COEFF: 0.0045,        // 油耗估算系数 (load×rpm×排量×系数 → L/h)
+
+  // --- 仪表盘布局 (云端下发车机渲染) ---
+  // 改布局不用编译 APK, 改这里 PM2 restart 即可
+  DASHBOARD: {
+    theme: { bg: '#1A1C1E', accent: '#4FC3F7', text: '#E0E0E0', dim: '#546E7A',
+             green: '#81C784', yellow: '#FFD600', blue: '#64B5F6', purple: '#E1BEE7',
+             label: '#A5D6A7', gauge: '#FFFFFF', fuelGreen: '#00FFAA', cardBg: '#0D150D' },
+    cards: [
+      { type:'header', text:'车机助手' },
+      { type:'gauge', key:'speed', label:'车速', unit:'公里/时', color:'#FFFFFF', size:72 },
+      { type:'grid2', label: '>> 仪表盘', items: [
+        { key:'fuelPer100km', label:'瞬时油耗', unit:'L/100km', fmt:'%.1f', color:'#00FFAA' },
+        { key:'fuelLevel',      label:'油量',      unit:'%',       fmt:'%.0f', color:'#FFFFFF' },
+        { key:'remainingRange', label:'续航里程',   unit:'km',     fmt:'%d',   color:'#64B5F6' },
+        { key:'tripDistanceKm', label:'本次里程',   unit:'km',     fmt:'%.1f', color:'#81C784' },
+        { key:'tripDuration',   label:'行程时长',   unit:'　',    fmt:'%s',   color:'#E1BEE7', text:true },
+        { key:'tripFuelCost',   label:'本次油费',   unit:'元',     fmt:'%.1f', color:'#FFD600' },
+        { key:'dailyDistanceKm',label:'本日里程',   unit:'km',     fmt:'%.1f', color:'#81C784' },
+        { key:'dailyFuelCost',  label:'本日油费',   unit:'元',     fmt:'%.1f', color:'#FFD600' },
+        { key:'monthlyDistanceKm',label:'本月里程', unit:'km',     fmt:'%.1f', color:'#81C784' },
+        { key:'monthlyFuelCost',label:'本月油费',   unit:'元',     fmt:'%.1f', color:'#FFD600' }
+      ]},
+      { type:'status', key:'_status', label:'状态' },
+      { type:'info', text:'v6.25.1 :: YOUR_VPS_IP:8899' }
+    ]
+  },
+
+  // --- 扫描 PID ---
+  SCAN_PID_LIST: [0x0D, 0x0C, 0x04, 0x05, 0x10, 0x43, 0x0B, 0x0F, 0x06, 0x07],  // 当前活跃PID, 云端下发手机轮询
+  FULL_PID_LIST: [0x0D,0x0C,0x04,0x05, 0x0B,0x0F,0x10,0x11, 0x06,0x07,0x0E,0x33,0x42,0x43,0x44,0x0A],
+
+  // --- 行程参数 ---
+  DRIVE_FATIGUE_H: 2,              // 连续驾驶多少小时触发疲劳提醒
+  DAILY_REPORT_HOUR: 9,            // 每日报告推送时间（北京时间）
+  MIN_CLIENT_VERSION: '6.10',      // CarAgent 最低版本要求
+  TRIP_TIMEOUT_MS: 30 * 60_000,    // 30分钟无GPS更新自动结束行程
+  TRIP_TIMEOUT_CHECK_MS: 60_000,   // 每分钟检查一次超时
+  CALIBRATION_MAX: 100,            // 校准样本上限（与 storage.js 保持一致）
+
+  // --- 限制 ---
+  MAX_BODY: 1_048_576,             // HTTP请求体上限 1MB
+  MAX_GEO_CACHE: 1000,             // 反向地理编码缓存条目上限
+
+  // --- 城市→本地宝子域名映射 ---
+  // 用于从对应城市页面拉取实时油价
+  CITY_DOMAIN_MAP: {
+    '合肥':'hf','上海':'sh','北京':'bj','深圳':'sz','广州':'gz','杭州':'hz',
+    '南京':'nj','武汉':'wh','成都':'cd','重庆':'cq','天津':'tj','苏州':'szh',
+    '西安':'xa','长沙':'cs','郑州':'zz','济南':'jn','青岛':'qd','大连':'dl',
+    '沈阳':'sy','哈尔滨':'heb','长春':'cc','福州':'fz','厦门':'xm','昆明':'km',
+    '贵阳':'gy','南宁':'nn','海口':'hk','石家庄':'sjz','太原':'ty','兰州':'lz',
+    '西宁':'xn','银川':'yc','乌鲁木齐':'wlmq','拉萨':'ls','南昌':'nc',
+    '东莞':'dg','佛山':'fs','珠海':'zh','中山':'zs','惠州':'huizhou','常州':'cz',
+    '无锡':'wx','温州':'wz','绍兴':'sx','嘉兴':'jx','芜湖':'whh','安庆':'aq',
+    '蚌埠':'bb','马鞍山':'mas','铜陵':'tl','黄山':'hs','滁州':'czz','阜阳':'fy',
+    '宿州':'szu','六安':'la','亳州':'bz','池州':'chiz','宣城':'xc',
+  }
+};
+
+──────────────────────────────────────────────────────────
+文件: carbridge/logger.js
+──────────────────────────────────────────────────────────
+// CarBridge v4.5 — 日志系统
+// ============================
+// 每日日志文件轮转 + 7天自动清理
+// WARN 级别同时输出到 stderr，方便 PM2 捕获
+
+const fs = require('fs');
+const path = require('path');
+const config = require('./config');
+
+// 确保日志目录存在
+[config.LOG_DIR, config.DIAG_DIR].forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+/** 启动时清理 7 天前的日志文件（含 diag 子目录） */
+(function cleanupOldLogs() {
+  try {
+    const now = Date.now();
+    // 主日志目录
+    const files = fs.readdirSync(config.LOG_DIR);
+    for (const f of files) {
+      const fp = path.join(config.LOG_DIR, f);
+      if (f.endsWith('.log') && (now - fs.statSync(fp).mtimeMs > 7 * 86400_000)) {
+        fs.unlinkSync(fp);
+        process.stdout.write('[LOG] 清理旧日志: ' + f + '\n');
+      }
+    }
+    // diag 子目录清理（30天，防 OBD 诊断日志无限增长）
+    if (fs.existsSync(config.DIAG_DIR)) {
+      const diagFiles = fs.readdirSync(config.DIAG_DIR);
+      for (const f of diagFiles) {
+        const fp = path.join(config.DIAG_DIR, f);
+        if (now - fs.statSync(fp).mtimeMs > 30 * 86400_000) {
+          fs.unlinkSync(fp);
+          process.stdout.write('[LOG] 清理旧诊断: ' + f + '\n');
+        }
+      }
+    }
+  } catch(e) { /* 忽略清理异常 */ }
+})();
+
+/**
+ * 写入日志行
+ * @param {'INFO'|'WARN'} level
+ * @param {string} msg   主消息
+ * @param {string} [detail] 可选的附加详情
+ */
+function writeLog(level, msg, detail) {
+  // 北京时间 ISO 格式 (UTC+8)
+  const now = new Date(Date.now() + 8 * 3600_000);
+  const ts = now.toISOString().replace('Z', '+08');
+  const line = '[' + ts + '] ' + level + '  ' + msg + (detail ? ' | ' + detail : '') + '\n';
+  // WARN 级别双写：stdout + stderr
+  if (level === 'WARN') process.stderr.write(line);
+  else process.stdout.write(line);
+  // 写入当日日志文件
+  const today = new Date().toISOString().slice(0, 10);
+  const logPath = path.join(config.LOG_DIR, today + '.log');
+  try { fs.appendFileSync(logPath, line); } catch(e) {}
+}
+
+/** INFO 日志 */
+function logInfo(msg, detail) { writeLog('INFO', msg, detail); }
+
+/** WARN 日志 */
+function logWarn(msg, detail) { writeLog('WARN', msg, detail); }
+
+module.exports = { writeLog, logInfo, logWarn };
+
+──────────────────────────────────────────────────────────
+文件: carbridge/storage.js
+──────────────────────────────────────────────────────────
+// CarBridge v4.5 — 状态管理与持久化
+// =====================================
+// 所有全局状态集中管理，JSON 文件落盘。
+// 定期自动保存（10分钟），服务退出时同步写入。
+// parkHistory 已完全移除。
+
+const fs = require('fs');
+const path = require('path');
+const config = require('./config');
+const { logInfo, logWarn } = require('./logger');
+
+// ====== 全局状态 ======
+
+// 收进对象避免原始类型导出脱耦：exports.fuelPrice 是值拷贝，
+// 外部 st.fuelPrice = x 写不到此局部变量。用 fuelState 对象引用共享。
+let fuelState = {
+  price: 8.00,       // 实时 92# 油价（从本地宝拉取）
+  time: null,        // 油价更新时间 ISO
+  city: null,        // 当前油价对应城市
+  subdomain: null    // 本地宝子域名
+};
+
+let carState = {
+  speed: 0, lat: 0, lng: 0,
+  heading: '', battery: 100, engineOn: false,
+  obdState: 'disconnected', obdError: null, obdElmVer: null,
+  obdValidCount: 0, obdAttempted: false, obdSkipReason: null,
+  coolantTemp: 0,
+  obdVoltage: 12.5,
+  fuelConsumption: 0,          // OBD 累计油耗 (L)
+  odometer: 0,                 // 仪表盘总里程 (km)
+  lastUpdate: null,            // GPS 心跳时间 (ISO)
+  lastGpsUpdate: null,         // 最后一次 GPS 更新时间
+  destinationName: '',
+  obdData: {},                 // 手机中继全部 OBD 字段
+  obdLastSeen: null,           // OBD 最后到达时间
+  // 校准状态（前缀 _ 表示不持久化到 carState.json 顶层，单独存 calibrations.json）
+  _calibrations: [],           // 校准样本数组
+  _fuelCalibCoeff: 1.0,       // 加权平均校准系数
+  _fuelCalibIdleCoeff: 1.0,   // 怠速校准系数
+  _fuelCalibCruiseCoeff: 1.0, // 巡航校准系数
+  _fuelCalibWotCoeff: 1.15,   // 急加速校准系数
+  _carNotify: null,            // 车机通知（疲劳提醒等，消费后清除）
+};
+
+let tripHistory = [];
+let currentTrip = {
+  startTime: null, startLocation: '',
+  points: [],
+  fuelStart: 0,
+  fatigueWarned: false,
+  obdVoltageStart: null, obdTempStart: null, obdRpmStart: null
+};
+
+let tripStats = {
+  daily:   { date: '', trips: 0, km: 0, fuel: 0, cost: 0 },
+  weekly:  { weekStart: '', trips: 0, km: 0, fuel: 0, cost: 0 },
+  monthly: { month: '', trips: 0, km: 0, fuel: 0, cost: 0 },
+  yearly:  { year: '', trips: 0, km: 0, fuel: 0, cost: 0 }
+};
+
+let lastDailyReport = { date: '' };  // 对象引用，避免 let 原语导出脱耦
+
+// ====== 油量校准映射表 ======
+// 用户喂数据: { raw: 0x10, pct: 52 } → 线性插值
+let fuelLevelMap = {};  // { "rawVal": pct }  如 {"16":52, "255":100}
+
+// ====== 滚动油耗窗口 (续航计算) ======
+let fuelSamples = [];  // [{km: totalOdo, fuel: cons}, ...] 只保留最近 30 km 的样本
+
+// 确保 data 目录存在
+if (!fs.existsSync(config.DATA_DIR)) fs.mkdirSync(config.DATA_DIR, { recursive: true });
+
+// ====== 持久化函数 ======
+
+/** 异步保存所有数据（定期调用） */
+function saveData() {
+  const fp = { price: fuelState.price, time: fuelState.time, city: fuelState.city, subdomain: fuelState.subdomain };
+  const car = {
+    odometer: carState.odometer,
+    fuelConsumption: carState.fuelConsumption,
+    fuelLevel: carState.fuelLevel,
+    fuelCalibCoeff: carState._fuelCalibCoeff || 1.0,
+    fuelCalibIdleCoeff: carState._fuelCalibIdleCoeff || 1.0,
+    fuelCalibCruiseCoeff: carState._fuelCalibCruiseCoeff || 1.0,
+    fuelCalibWotCoeff: carState._fuelCalibWotCoeff || 1.15
+  };
+  const calib = (carState._calibrations || []).slice(-config.CALIBRATION_MAX);
+
+  fs.promises.writeFile(path.join(config.DATA_DIR, 'fuelPrice.json'), JSON.stringify(fp))
+    .catch(e => logWarn('save fuelPrice', e.message));
+  fs.promises.writeFile(path.join(config.DATA_DIR, 'tripHistory.json'), JSON.stringify(tripHistory))
+    .catch(e => logWarn('save tripHistory', e.message));
+  fs.promises.writeFile(path.join(config.DATA_DIR, 'tripStats.json'), JSON.stringify(tripStats))
+    .catch(e => logWarn('save tripStats', e.message));
+  fs.promises.writeFile(path.join(config.DATA_DIR, 'carState.json'), JSON.stringify(car))
+    .catch(e => logWarn('save carState', e.message));
+  fs.promises.writeFile(path.join(config.DATA_DIR, 'calibrations.json'), JSON.stringify(calib))
+    .catch(e => logWarn('save calibrations', e.message));
+  fs.promises.writeFile(path.join(config.DATA_DIR, 'fuelLevelMap.json'), JSON.stringify(fuelLevelMap))
+    .catch(e => logWarn('save fuelLevelMap', e.message));
+}
+
+/** 同步保存所有数据（仅退出时使用，确保不丢） */
+function saveDataSync() {
+  try {
+    const fp = { price: fuelState.price, time: fuelState.time, city: fuelState.city, subdomain: fuelState.subdomain };
+    fs.writeFileSync(path.join(config.DATA_DIR, 'fuelPrice.json'), JSON.stringify(fp));
+    fs.writeFileSync(path.join(config.DATA_DIR, 'tripHistory.json'), JSON.stringify(tripHistory));
+    fs.writeFileSync(path.join(config.DATA_DIR, 'tripStats.json'), JSON.stringify(tripStats));
+    fs.writeFileSync(path.join(config.DATA_DIR, 'carState.json'), JSON.stringify({
+      odometer: carState.odometer,
+      fuelConsumption: carState.fuelConsumption,
+      fuelLevel: carState.fuelLevel,
+      fuelCalibCoeff: carState._fuelCalibCoeff || 1.0,
+      fuelCalibIdleCoeff: carState._fuelCalibIdleCoeff || 1.0,
+      fuelCalibCruiseCoeff: carState._fuelCalibCruiseCoeff || 1.0,
+      fuelCalibWotCoeff: carState._fuelCalibWotCoeff || 1.15
+    }));
+    fs.writeFileSync(path.join(config.DATA_DIR, 'calibrations.json'),
+      JSON.stringify(carState._calibrations || []));
+    fs.writeFileSync(path.join(config.DATA_DIR, 'fuelLevelMap.json'), JSON.stringify(fuelLevelMap));
+  } catch(e) { logWarn('saveDataSync error', e.message); }
+}
+
+/** 启动时从 JSON 文件恢复所有状态 */
+function loadData() {
+  try {
+    // 恢复行程历史
+    const th = path.join(config.DATA_DIR, 'tripHistory.json');
+    if (fs.existsSync(th)) tripHistory = JSON.parse(fs.readFileSync(th, 'utf8'));
+
+    // 恢复统计
+    const ts = path.join(config.DATA_DIR, 'tripStats.json');
+    if (fs.existsSync(ts)) tripStats = JSON.parse(fs.readFileSync(ts, 'utf8'));
+
+    // 恢复车辆状态 + 校准系数
+    const cs = path.join(config.DATA_DIR, 'carState.json');
+    if (fs.existsSync(cs)) {
+      const c = JSON.parse(fs.readFileSync(cs, 'utf8'));
+      if (c.odometer != null) carState.odometer = c.odometer;
+      if (c.fuelConsumption != null) carState.fuelConsumption = c.fuelConsumption;
+      if (c.fuelLevel != null) carState.fuelLevel = c.fuelLevel;
+      if (c.fuelCalibCoeff != null) carState._fuelCalibCoeff = c.fuelCalibCoeff;
+      if (c.fuelCalibIdleCoeff != null) carState._fuelCalibIdleCoeff = c.fuelCalibIdleCoeff;
+      if (c.fuelCalibCruiseCoeff != null) carState._fuelCalibCruiseCoeff = c.fuelCalibCruiseCoeff;
+      if (c.fuelCalibWotCoeff != null) carState._fuelCalibWotCoeff = c.fuelCalibWotCoeff;
+    }
+
+    // 恢复油价
+    const fp = path.join(config.DATA_DIR, 'fuelPrice.json');
+    if (fs.existsSync(fp)) {
+      const f = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      fuelState.price = f.price || 8.00;
+      fuelState.time = f.time || null;
+      fuelState.city = f.city || null;
+      fuelState.subdomain = f.subdomain || null;
+    }
+
+    // 恢复校准记录
+    const calPath = path.join(config.DATA_DIR, 'calibrations.json');
+    if (fs.existsSync(calPath)) {
+      const raw = JSON.parse(fs.readFileSync(calPath, 'utf8'));
+      carState._calibrations = raw.slice(-config.CALIBRATION_MAX);
+    }
+
+    // 恢复油量映射表
+    const flmPath = path.join(config.DATA_DIR, 'fuelLevelMap.json');
+    if (fs.existsSync(flmPath)) {
+      fuelLevelMap = JSON.parse(fs.readFileSync(flmPath, 'utf8'));
+    }
+
+    logInfo('数据已加载',
+      'trips=' + tripHistory.length +
+      ' 油价=¥' + fuelState.price +
+      (fuelState.city ? ' (' + fuelState.city + ')' : '') +
+      ' 校准=' + (carState._calibrations || []).length + '条' +
+      ' 油量映射=' + Object.keys(fuelLevelMap).length + '点' +
+      ' (coeff=' + ((carState._fuelCalibCoeff || 1.0).toFixed(3)) + ')');
+
+    // 延迟加载 fuel 模块避免循环依赖
+    if (fuelState.city) {
+      const { fetchFuelPrice } = require('./fuel');
+      fetchFuelPrice(fuelState.city);
+    }
+  } catch(e) { logWarn('loadData error', e.message); }
+}
+
+// 每 10 分钟自动持久化，防进程 crash 丢数据
+setInterval(() => { saveData(); }, 10 * 60_000);
+
+module.exports = {
+  // 状态对象（引用导出，模块间共享同一实例）
+  carState, currentTrip, tripHistory, tripStats,
+  fuelState,  // 油价状态对象（引用，避免原始类型值拷贝）
+  lastDailyReport,
+  fuelLevelMap, fuelSamples,  // 油量映射表 + 滚动油耗窗口
+  // 函数
+  saveData, saveDataSync, loadData
+};
+
+──────────────────────────────────────────────────────────
+文件: carbridge/geo.js
+──────────────────────────────────────────────────────────
+// CarBridge v4.5 — 地理工具
+// ============================
+// WGS84↔GCJ02 坐标转换、Haversine 距离、Nominatim 反向地理编码
+// 北京时间工具函数
+
+const https = require('https');
+const config = require('./config');
+
+// ====== WGS84→GCJ02 坐标转换（高德/腾讯地图坐标系） ======
+// 纯数学算法，无需网络请求。中国境内偏差可修正到米级。
+
+function wgs84ToGcj02(wgsLat, wgsLng) {
+  const a = 6378245.0, ee = 0.00669342162296594323;
+  function transformLat(x, y) {
+    let ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+    ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+    ret += (20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin(y / 3.0 * Math.PI)) * 2.0 / 3.0;
+    ret += (160.0 * Math.sin(y / 12.0 * Math.PI) + 320.0 * Math.sin(y * Math.PI / 30.0)) * 2.0 / 3.0;
+    return ret;
+  }
+  function transformLng(x, y) {
+    let ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+    ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
+    ret += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0;
+    ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0;
+    return ret;
+  }
+  const dLat = transformLat(wgsLng - 105.0, wgsLat - 35.0);
+  const dLng = transformLng(wgsLng - 105.0, wgsLat - 35.0);
+  const radLat = wgsLat / 180.0 * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - ee * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  const dLat2 = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * Math.PI);
+  const dLng2 = (dLng * 180.0) / (a / sqrtMagic * Math.cos(radLat) * Math.PI);
+  return { lat: wgsLat + dLat2, lng: wgsLng + dLng2 };
+}
+
+/** 生成高德地图标记链接 */
+function amapUrl(lat, lng, name) {
+  const gcj = wgs84ToGcj02(lat, lng);
+  return 'https://uri.amap.com/marker?position=' + gcj.lng.toFixed(6) + ',' + gcj.lat.toFixed(6)
+    + '&name=' + encodeURIComponent(name || '车辆位置');
+}
+
+/** Haversine 公式计算两点间距（公里） */
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const a = Math.sin((lat2-lat1)*Math.PI/180/2)**2 +
+    Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) *
+    Math.sin((lon2-lon1)*Math.PI/180/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// ====== 反向地理编码（Nominatim，免费无 API Key） ======
+// 队列化：限速 1.5s/请求，防封禁。LRU 缓存已解析坐标。
+
+let reverseGeoCache = new Map();
+let _geoCacheKeyOrder = [];   // FIFO-LRU 淘汰顺序
+let _geoLastRequestMs = 0;    // 上次请求时间
+let _geoQueue = [];           // 待处理请求队列
+let _geoQueueTimer = null;    // 队列消费定时器
+
+function reverseGeo(lat, lng, callback) {
+  const key = lat.toFixed(3) + ',' + lng.toFixed(3);
+  if (reverseGeoCache.has(key)) {
+    callback(reverseGeoCache.get(key));
+    return;
+  }
+  _geoQueue.push({ lat, lng, callback });
+  if (!_geoQueueTimer) _processGeoQueue();
+}
+
+function _processGeoQueue() {
+  if (!_geoQueue.length) { _geoQueueTimer = null; return; }
+  const wait = Math.max(0, 1500 - (Date.now() - _geoLastRequestMs));
+  _geoQueueTimer = setTimeout(() => {
+    if (!_geoQueue.length) { _geoQueueTimer = null; return; }
+    _geoLastRequestMs = Date.now();
+    const r = _geoQueue.shift();
+    _reverseGeoDirect(r.lat, r.lng, r.callback);
+  }, wait);
+}
+
+function _reverseGeoDirect(lat, lng, callback) {
+  const key = lat.toFixed(3) + ',' + lng.toFixed(3);
+  if (reverseGeoCache.has(key)) {
+    const idx = _geoCacheKeyOrder.indexOf(key);
+    if (idx >= 0) { _geoCacheKeyOrder.splice(idx, 1); _geoCacheKeyOrder.push(key); }
+    callback(reverseGeoCache.get(key));
+    return;
+  }
+  const opt = {
+    hostname: 'nominatim.openstreetmap.org',
+    port: 443,
+    path: '/reverse?lat=' + lat + '&lon=' + lng + '&format=json&zoom=14&accept-language=zh',
+    method: 'GET',
+    headers: { 'User-Agent': 'CarBridge/4.0' },
+    timeout: 5000
+  };
+  const req = https.request(opt, (res) => {
+    let b = '';
+    res.on('data', c => b += c);
+    res.on('end', () => {
+      try {
+        const j = JSON.parse(b);
+        const name = j.display_name || key;
+        _cacheGeo(key, name);
+        callback(name);
+      } catch(e) {
+        const fallback = key;
+        _cacheGeo(key, fallback);
+        callback(fallback);
+      }
+    });
+  });
+  req.on('error', () => callback(key));
+  req.on('timeout', () => { req.destroy(); callback(key); });
+  req.end();
+}
+
+function _cacheGeo(key, value) {
+  reverseGeoCache.set(key, value);
+  _geoCacheKeyOrder.push(key);
+  if (_geoCacheKeyOrder.length > config.MAX_GEO_CACHE) {
+    reverseGeoCache.delete(_geoCacheKeyOrder.shift());
+  }
+}
+
+/** 从 Nominatim display_name 提取城市名 */
+function extractCity(displayName) {
+  const m = displayName.match(/([\u4e00-\u9fff]+市)/);
+  if (m) return m[1].replace('市', '');
+  const m2 = displayName.match(/(北京|上海|天津|重庆)/);
+  return m2 ? m2[1] : null;
+}
+
+// ====== 北京时间工具（纯 UTC 偏移，不依赖系统时区） ======
+
+function beijingDateStr(now = new Date()) {
+  return new Date(now.getTime() + 8 * 3600_000).toISOString().slice(0, 10);
+}
+
+function beijingHour() {
+  return new Date(Date.now() + 8 * 3600_000).getUTCHours();
+}
+
+function formatTime() {
+  return new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+}
+
+/** 计算北京时间所在周数（纯 UTC，不依赖服务器系统时区） */
+function getWeekNumber(realNow = new Date()) {
+  const bjTs = realNow.getTime() + 8 * 3600_000;  // 北京时间毫秒（假UTC）
+  const bjDate = new Date(bjTs);
+  // 用 Date.UTC 构造年初，避免服务器本地时区偏移
+  const startOfYear = Date.UTC(bjDate.getUTCFullYear(), 0, 1);
+  const diff = bjTs - startOfYear;
+  const jan1Day = new Date(startOfYear).getUTCDay();  // 1月1日是周几 (0=日)
+  return Math.ceil((diff / 86400000 + jan1Day + 1) / 7);
+}
+
+/**
+ * 计算指定日期的日出日落时间 (北京时间 HH:MM)
+ * @param {number} lat 纬度
+ * @param {number} lng 经度
+ * @param {Date} date 日期 (默认今天)
+ * @returns {{sunrise: string, sunset: string}} 北京时间
+ */
+function calcSunriseSunset(lat, lng, date) {
+  const d = date ? new Date(date) : new Date(Date.now() + 8 * 3600_000);
+  // 使用北京时间正午的UTC日序
+  const bjNoon = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 4, 0, 0)); // 12:00 BJT = 04:00 UTC
+  const doy = dayOfYear(bjNoon);
+  
+  // 太阳平均近点角
+  const meanAnomaly = (357.5291 + 0.98560028 * (doy - 1)) % 360;
+  const maRad = meanAnomaly * Math.PI / 180;
+  
+  // 方程中心
+  const eqCenter = 1.9148 * Math.sin(maRad) + 0.02 * Math.sin(2 * maRad) + 0.0003 * Math.sin(3 * maRad);
+  
+  // 黄道经度
+  const eclipticLng = (meanAnomaly + eqCenter + 180 + 102.9372) % 360;
+  const elRad = eclipticLng * Math.PI / 180;
+  
+  // 太阳赤纬
+  const declination = Math.asin(Math.sin(elRad) * Math.sin(23.44 * Math.PI / 180));
+  
+  // 时差 (分钟)
+  const timeEq = 4 * (
+    7.53 * Math.cos(maRad)
+    + 1.5 * Math.sin(maRad)
+    - 9.87 * Math.sin(2 * maRad)
+  );
+  
+  // 日出/日落时角
+  const latRad = lat * Math.PI / 180;
+  const cosHa = (Math.sin(-0.833 * Math.PI / 180) - Math.sin(latRad) * Math.sin(declination))
+    / (Math.cos(latRad) * Math.cos(declination));
+  
+  // 极昼/极夜保护
+  let haDeg;
+  if (cosHa > 1) haDeg = 0;     // 极夜
+  else if (cosHa < -1) haDeg = 180; // 极昼
+  else haDeg = Math.acos(cosHa) * 180 / Math.PI;
+  
+  // 正午 UTC 分钟
+  const solarNoonUtc = 720 - 4 * lng - timeEq;
+  const sunriseUtc = solarNoonUtc - 4 * haDeg;
+  const sunsetUtc = solarNoonUtc + 4 * haDeg;
+
+  // 转为北京时间
+  const sunriseBjt = (sunriseUtc + 480) % 1440; // UTC→BJT +8h=480min
+  const sunsetBjt = (sunsetUtc + 480) % 1440;
+  
+  const fmt = (mins) => {
+    const h = Math.floor(mins / 60) % 24;
+    const m = Math.round(mins % 60);
+    return String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0');
+  };
+  
+  return { sunrise: fmt(sunriseBjt), sunset: fmt(sunsetBjt) };
+}
+
+function dayOfYear(date) {
+  const start = Date.UTC(date.getUTCFullYear(), 0, 0);
+  return Math.floor((date.getTime() - start) / 86400000);
+}
+
+/**
+ * 判断当前是否夜间
+ * @param {number} lat 纬度
+ * @param {number} lng 经度
+ * @returns {boolean} true=夜间
+ */
+function isNightNow(lat, lng) {
+  if (!lat || !lng || Math.abs(lat) < 0.01) {
+    // 无 GPS, 用北京时间 6:00-18:00 兜底
+    const h = beijingHour();
+    return h < 6 || h >= 18;
+  }
+  const { sunrise, sunset } = calcSunriseSunset(lat, lng);
+  const now = beijingHour() * 60 + new Date(Date.now() + 8 * 3600_000).getUTCMinutes();
+  const riseMins = parseInt(sunrise.split(':')[0]) * 60 + parseInt(sunrise.split(':')[1]);
+  const setMins = parseInt(sunset.split(':')[0]) * 60 + parseInt(sunset.split(':')[1]);
+  return now < riseMins || now >= setMins;
+}
+
+module.exports = {
+  wgs84ToGcj02, amapUrl, haversine,
+  reverseGeo, extractCity,
+  beijingDateStr, beijingHour, formatTime, getWeekNumber,
+  calcSunriseSunset, isNightNow
+};
+
+──────────────────────────────────────────────────────────
+文件: carbridge/fuel.js
+──────────────────────────────────────────────────────────
+// CarBridge v4.5 — 油价与油耗校准
+// ====================================
+// 从本地宝拉取实时 92# 油价
+// 加油校准：加权平均计算 OBD 油耗修正系数
+
+const https = require('https');
+const config = require('./config');
+const { logInfo, logWarn } = require('./logger');
+const { extractCity } = require('./geo');
+
+// 延迟获取 storage，避免启动时的循环依赖
+let storage = null;
+function getStorage() {
+  if (!storage) storage = require('./storage');
+  return storage;
+}
+
+// ====== 城市→本地宝子域名 ======
+
+function getBendibaoDomain(cityName) {
+  return config.CITY_DOMAIN_MAP[cityName] || null;
+}
+
+// ====== 实时油价拉取 ======
+
+function fetchFuelPrice(cityName) {
+  // 尝试多种来源确定城市
+  let city = cityName;
+  const st = getStorage();
+  if (!city) city = st.fuelState.city;
+  if (!city) return; // 没有城市信息，跳过
+
+  const subdomain = getBendibaoDomain(city);
+  const hostname = subdomain ? subdomain + '.bendibao.com' : 'm.bendibao.com';
+
+  const opts = {
+    hostname: hostname,
+    path: '/news/youjiachaxun/',
+    method: 'GET',
+    timeout: 10000
+  };
+
+  const req = https.get(opts, (res) => {
+    let data = '';
+    res.on('data', chunk => data += chunk);
+    res.on('end', () => {
+      if (res.statusCode !== 200) { logWarn('油价拉取 HTTP ' + res.statusCode); return; }
+      try {
+        // 解析页面中的 oilData JS 变量
+        const match = data.match(/var oilData = ({[^;]+})/);
+        if (!match) { logWarn('油价解析失败', '未找到 oilData'); return; }
+        const oilData = JSON.parse(match[1]);
+        const idx92 = oilData.data.findIndex(d => d.name.includes('92'));
+        if (idx92 < 0) { logWarn('油价解析失败', '未找到92号汽油'); return; }
+        const prices = oilData.data[idx92].list;
+        const latest = parseFloat(prices[prices.length - 1]);
+        if (latest > 0) {
+          st.fuelState.price = latest;
+          st.fuelState.time = new Date().toISOString();
+          st.fuelState.city = city;
+          st.fuelState.subdomain = subdomain || 'm';
+          st.saveData();
+          logInfo('油价更新', city + ' 92# = ¥' + st.fuelState.price + '/L (本地宝)');
+        }
+      } catch(e) { logWarn('油价异常', e.message); }
+    });
+  });
+  req.on('error', (e) => logWarn('油价拉取错误', e.message));
+  req.on('timeout', () => { req.destroy(); logWarn('油价拉取超时'); });
+}
+
+// ====== 油耗校准 ======
+
+/**
+ * 处理加油校准请求
+ * POST /api/car/calibration
+ * Body: { tag, actualLiters, cumulativeFuel, ... }
+ * 校准公式: 加权平均(实际加油量 / APP累计油耗)
+ * @returns {{statusCode: number, body: object}}
+ */
+function handleCalibration(bodyStr) {
+  const st = getStorage();
+  const d = JSON.parse(bodyStr);
+  d.receivedAt = new Date().toISOString();
+
+  st.carState._calibrations = st.carState._calibrations || [];
+  st.carState._calibrations.push(d);
+  // 保留最近 N 条（与 config.CALIBRATION_MAX 一致）
+  if (st.carState._calibrations.length > config.CALIBRATION_MAX) {
+    st.carState._calibrations = st.carState._calibrations.slice(-config.CALIBRATION_MAX);
+  }
+
+  // 计算校准系数: 实际加油量 / APP累计油耗
+  const pairs = st.carState._calibrations
+    .filter(c => c.actualLiters > 0 && c.cumulativeFuel > 0 && c.tag === '满油')
+    .map(c => ({
+      ratio: parseFloat(c.actualLiters) / parseFloat(c.cumulativeFuel),
+      fuel: parseFloat(c.cumulativeFuel)
+    }));
+
+  if (pairs.length > 0) {
+    // 加权平均: 加油量越大权重越高
+    const totalWeight = pairs.reduce((s, p) => s + p.fuel, 0);
+    st.carState._fuelCalibCoeff = pairs.reduce((s, p) => s + p.ratio * p.fuel, 0) / totalWeight;
+  }
+  const coeff = st.carState._fuelCalibCoeff || 1.0;
+
+  logInfo('油耗校准',
+    `${d.tag || '?'} | 累计=${d.cumulativeFuel}L | ` +
+    (d.actualLiters ? `实际=${d.actualLiters}L` : '标记') +
+    ` | coeff=${coeff.toFixed(3)} | 样本数=${pairs.length}`);
+
+  st.saveData(); // 校准后立即持久化
+
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      coefficient: coeff,
+      samples: pairs.length,
+      idleCoeff: st.carState._fuelCalibIdleCoeff || 1.0,
+      cruiseCoeff: st.carState._fuelCalibCruiseCoeff || 1.0,
+      wotCoeff: st.carState._fuelCalibWotCoeff || 1.15
+    }
+  };
+}
+
+module.exports = { fetchFuelPrice, handleCalibration, getBendibaoDomain };
+
+──────────────────────────────────────────────────────────
+文件: carbridge/trip.js
+──────────────────────────────────────────────────────────
+// CarBridge v6.25.1 — 行程管理
+// ============================
+// 行程开始/结束、GPS状态更新、OBD中继、周期统计
+// v6.25.1: 移除微信推送, 推送由 OpenClaw cron 负责
+
+const fs = require('fs');
+const path = require('path');
+const config = require('./config');
+const { logInfo, logWarn } = require('./logger');
+const storage = require('./storage');
+const { reverseGeo, extractCity, haversine, amapUrl, beijingDateStr,
+        beijingHour, formatTime, getWeekNumber } = require('./geo');
+const { fetchFuelPrice } = require('./fuel');
+
+// ====== 统计计算 ======
+
+/** 从行程 GPS 点计算里程、均速、极速、耗时 */
+function calcStats(trip, fuelFromClient) {
+  if (!trip.points || trip.points.length < 2) return null;
+  let dist = 0, maxS = 0, sumS = 0, cntS = 0;
+  for (let i = 1; i < trip.points.length; i++) {
+    const p1 = trip.points[i-1], p2 = trip.points[i];
+    dist += haversine(p1.lat, p1.lng, p2.lat, p2.lng);
+    if (p2.speed > maxS) maxS = p2.speed;
+    if (p2.speed > 0) { sumS += p2.speed; cntS++; }
+  }
+  const durMin = Math.max(0, (new Date(trip.points[trip.points.length-1].time) - new Date(trip.startTime)) / 60000);
+  return {
+    mileage: dist,
+    duration: Math.floor(durMin / 60) + '小时' + Math.round(durMin % 60) + '分',
+    avgSpeed: cntS > 0 ? sumS / cntS : 0,
+    maxSpeed: maxS,
+    fuelUsed: Math.max(0, fuelFromClient - (trip.fuelStart || 0))
+  };
+}
+
+// ====== 周期统计更新 ======
+
+function updateStats(stats) {
+  const st = storage;
+  const now = new Date();
+  const today = beijingDateStr(now);
+  const weekNum = getWeekNumber(now);
+  const bjNow = new Date(now.getTime() + 8 * 3600_000);
+  const month = bjNow.getFullYear() + '-' + String(bjNow.getMonth() + 1).padStart(2, '0');
+  const year = bjNow.getFullYear().toString();
+
+  // 日切换
+  if (st.tripStats.daily.date !== today) {
+    st.tripStats.daily = { date: today, trips: 0, km: 0, fuel: 0, cost: 0 };
+  }
+  // 周切换
+  const weekKey = bjNow.getUTCFullYear() + '-W' + weekNum;
+  if (st.tripStats.weekly.weekStart !== weekKey) {
+    st.tripStats.weekly = { weekStart: weekKey, trips: 0, km: 0, fuel: 0, cost: 0 };
+  }
+  // 月切换
+  if (st.tripStats.monthly.month !== month) {
+    st.tripStats.monthly = { month: month, trips: 0, km: 0, fuel: 0, cost: 0 };
+  }
+  // 年切换
+  if (st.tripStats.yearly.year !== year) {
+    st.tripStats.yearly = { year: year, trips: 0, km: 0, fuel: 0, cost: 0 };
+  }
+
+  // 累加本次行程数据
+  const fuel = stats.fuelUsed || 0;
+  for (const p of ['daily', 'weekly', 'monthly', 'yearly']) {
+    st.tripStats[p].trips++;
+    st.tripStats[p].km += stats.mileage;
+    st.tripStats[p].fuel += fuel;
+    st.tripStats[p].cost += fuel * st.fuelState.price;
+  }
+  st.saveData();
+}
+
+/** 按周期筛选行程历史 */
+function getTripsForPeriod(periodKey, periodType) {
+  return storage.tripHistory.filter(t => {
+    const d = new Date(t.date || t.time);
+    const bj = new Date(d.getTime() + 8 * 3600_000);
+    if (periodType === 'week') {
+      const w = getWeekNumber(d);
+      const y = bj.getUTCFullYear();
+      // periodKey 格式: "2026-W52"
+      const parts = String(periodKey).split('-W');
+      const pkYear = parseInt(parts[0]) || bj.getUTCFullYear();
+      const pkWeek = parseInt(parts[1]) || 0;
+      return w === pkWeek && y === pkYear;
+    } else if (periodType === 'month') {
+      const m = bj.getFullYear() + '-' + String(bj.getMonth() + 1).padStart(2, '0');
+      return m === periodKey;
+    } else if (periodType === 'year') {
+      return bj.getFullYear().toString() === periodKey;
+    } else {
+      return bj.toISOString().slice(0, 10) === periodKey;
+    }
+  });
+}
+
+// ====== 行程结算 ======
+
+/**
+ * 结算行程：计算统计、写入历史、更新周期统计、推送微信
+ * fuelConsumptionFromClient 来自客户端上报，始终为 0.0；
+ * 实际油耗由 VPS 端 handleObd 积分维护 (dtH × fuelRate)
+ */
+function finishTrip(trip, endLoc, _fuelConsumptionFromClient, odometer) {
+  const st = storage;
+  // 信任 VPS 自己积分的累计油耗，忽略客户端传来的值（客户端硬编码为 0.0）
+  const vpsFuel = st.carState.fuelConsumption || 0;
+  const stats = calcStats(trip, vpsFuel);
+
+  try {
+    if (stats) {
+      stats.date = new Date().toISOString();
+      stats.startLocation = trip.startLocation;
+      stats.endLocation = endLoc;
+      st.tripHistory.push(stats);
+      if (st.tripHistory.length > 100) st.tripHistory = st.tripHistory.slice(-100);
+      updateStats(stats);
+
+      st.saveData();
+    }
+
+    if (odometer > 0) st.carState.odometer = odometer;
+  } finally {
+    // ⚠️ 无论成功失败，必须清除 _ending 防止卡死
+    delete st.currentTrip._ending;
+    st.currentTrip = {
+      startTime: null, startLocation: '', points: [],
+      fuelStart: 0, liveDistanceKm: 0, fatigueWarned: false,
+      obdVoltageStart: null, obdTempStart: null, obdRpmStart: null
+    };
+  }
+
+  return { statusCode: 200, body: { ok: true, stats: stats } };
+}
+
+// ====== HTTP Handler 函数（返回 {statusCode, body}） ======
+
+/** POST /api/car/status — GPS 状态上报 */
+function handleStatus(bodyStr) {
+  const st = storage;
+  const d = JSON.parse(bodyStr);
+
+  // 存储车机日志快照到 logs/ 目录
+  if (d._log && typeof d._log === 'string') {
+    try {
+      const logPath = path.join(config.LOG_DIR, 'car_agent.log');
+      let logText = d._log;
+      if (logText.length > 500_000) logText = logText.slice(-500_000);
+      fs.writeFileSync(logPath, logText, 'utf8');
+      delete d._log;
+    } catch(e) { logWarn('carLog write error', e.message); }
+  }
+
+  // 更新车辆状态字段
+  if (d.speed !== undefined) st.carState.speed = d.speed;
+  // GPS 坐标校验: 拦截 (0,0) 及超出中国范围的无效坐标 (防止注入幽灵里程)
+  if (d.lat !== undefined && d.lng !== undefined
+    && d.lat > 0.1 && d.lng > 70 && d.lng < 140) {
+    st.carState.lat = d.lat; st.carState.lng = d.lng;
+  } else if (d.lat !== undefined && d.lng !== undefined) {
+    // 保留上次有效坐标, 不更新 carState
+  }
+  if (d.heading) st.carState.heading = d.heading;
+  if (d.engineOn !== undefined) st.carState.engineOn = d.engineOn;
+  if (d.coolantTemp !== undefined) st.carState.coolantTemp = d.coolantTemp;
+  if (d.obdVoltage !== undefined) st.carState.obdVoltage = d.obdVoltage;
+  if (d.obdState) st.carState.obdState = d.obdState;
+  if (d.obdError !== undefined) st.carState.obdError = d.obdError;
+  if (d.obdElmVer) st.carState.obdElmVer = d.obdElmVer;
+  if (d.obdValidCount !== undefined) st.carState.obdValidCount = d.obdValidCount;
+  if (d.obdAttempted !== undefined) st.carState.obdAttempted = d.obdAttempted;
+  if (d.obdSkipReason) st.carState.obdSkipReason = d.obdSkipReason;
+  if (d.engineRpm !== undefined) st.carState.engineRpm = d.engineRpm;
+  if (d.fuelLevel !== undefined) st.carState.fuelLevel = d.fuelLevel;
+  if (d.fuelRate !== undefined) st.carState.fuelRate = d.fuelRate;
+  if (d.fuelConsumption !== undefined) st.carState.fuelConsumption = d.fuelConsumption;
+  st.carState.lastUpdate = new Date().toISOString();
+  st.carState.lastGpsUpdate = st.carState.lastUpdate;
+
+  // OBD 状态变化记录
+  if (st.carState.obdState !== st.carState._lastObdState) {
+    logInfo('OBD状态', st.carState.obdState +
+      (st.carState.obdError ? ' err=' + st.carState.obdError : '') +
+      (st.carState.obdElmVer ? ' elm=' + st.carState.obdElmVer : '') +
+      ' attempted=' + st.carState.obdAttempted +
+      (st.carState.obdSkipReason ? ' skip=' + st.carState.obdSkipReason : ''));
+    st.carState._lastObdState = st.carState.obdState;
+  }
+  if (st.carState.obdAttempted && !st.carState._loggedObdStartup) {
+    st.carState._loggedObdStartup = true;
+    logInfo('OBD启动', 'attempted=' + st.carState.obdAttempted +
+      (st.carState.obdSkipReason ? ' skip=' + st.carState.obdSkipReason : ' mac_ok'));
+  }
+
+  // 首次获取城市（用于油价定位）
+  if (!st.fuelState.city && st.carState.lat && st.carState.lng) {
+    reverseGeo(st.carState.lat, st.carState.lng, (locName) => {
+      const city = extractCity(locName);
+      if (city) fetchFuelPrice(city);
+    });
+  }
+
+  // 记录行程 GPS 轨迹点
+  if (st.currentTrip.startTime && !st.currentTrip._ending) {
+    const prev = st.currentTrip.points.length > 0
+      ? st.currentTrip.points[st.currentTrip.points.length - 1] : null;
+    const pt = {
+      lat: st.carState.lat, lng: st.carState.lng,
+      speed: st.carState.speed,
+      time: st.carState.lastUpdate
+    };
+    st.currentTrip.points.push(pt);
+
+    // 增量累加里程 (避免 query 时 O(N) 遍历)
+    if (prev) {
+      const seg = haversine(prev.lat, prev.lng, pt.lat, pt.lng);
+      // 过滤异常 GPS 跳点: 距离>1km 且 当段速度<5km/h → 静置漂移
+      if (!(seg > 1 && prev.speed > 0 && seg / (Math.max(1, (new Date(pt.time) - new Date(prev.time)) / 3600000)) < 5)) {
+        st.currentTrip.liveDistanceKm = (st.currentTrip.liveDistanceKm || 0) + seg;
+        st.carState._totalOdoKm = (st.carState._totalOdoKm || 0) + seg;
+      }
+    }
+
+    if (st.currentTrip.points.length > 5000) {
+      st.currentTrip.points = st.currentTrip.points.slice(-5000);
+    }
+  }
+
+  // 疲劳驾驶检测
+  if (st.currentTrip.startTime) {
+    const elapsedH = (Date.now() - new Date(st.currentTrip.startTime).getTime()) / 3600000;
+    if (elapsedH >= config.DRIVE_FATIGUE_H && !st.currentTrip.fatigueWarned) {
+      st.currentTrip.fatigueWarned = true;
+      // v6.25.1: 疲劳提醒由车机自行处理
+    }
+  }
+
+  // 版本协商
+  if (d.version) {
+    const vParts = d.version.split('.').map(Number);
+    const minParts = config.MIN_CLIENT_VERSION.split('.').map(Number);
+    for (let i = 0; i < Math.max(vParts.length, minParts.length); i++) {
+      if ((vParts[i] || 0) < (minParts[i] || 0)) {
+        return {
+          statusCode: 200,
+          body: { ok: false, error: 'OUTDATED_CLIENT',
+            message: '请更新 CarAgent 到 v' + config.MIN_CLIENT_VERSION + '+' }
+        };
+      }
+      if ((vParts[i] || 0) > (minParts[i] || 0)) break;
+    }
+  }
+
+  return { statusCode: 200, body: { ok: true } };
+}
+
+/** POST /api/car/start — 行程开始 */
+function handleStart(bodyStr) {
+  const st = storage;
+  const d = JSON.parse(bodyStr);
+
+  if (st.currentTrip._ending || st.currentTrip._lock) {
+    return { statusCode: 200, body: { ok: false, error: 'trip busy' } };
+  }
+  if (st.currentTrip.startTime) {
+    return { statusCode: 200, body: { ok: false, error: 'already started' } };
+  }
+
+  // GPS 坐标校验：冷启动/未锁星时车机可能上报 (0,0)
+  const USEABLE_COORDS = (Math.abs(d.lat) > 0.001 || Math.abs(d.lng) > 0.001);
+
+  // ⚠️ 同步截取油耗快照, 防止异步回调期间 handleObd 污染
+  const fuelStartSnapshot = st.carState.fuelConsumption || 0;
+
+  // 异步解析地名，超时 7 秒兜底
+  return new Promise((resolve) => {
+    st.currentTrip._lock = true;
+    let resolved = false;
+    function done(placeName, fallbackLat, fallbackLng) {
+      if (resolved) return; resolved = true;
+      clearTimeout(timer);
+      // 兜底清洗：Nominatim 异常时 callback 返回的是坐标 key (如 "0.000,0.000")
+      if (/^-?\d+\.\d+,-?\d+\.\d+$/.test(placeName)) {
+        placeName = '未知';
+        logWarn('handleStart', 'reverseGeo 返回坐标 key，替换为未知');
+      }
+      const newCity = extractCity(placeName);
+      if (newCity && newCity !== st.fuelState.city) fetchFuelPrice(newCity);
+      st.currentTrip._lock = false;
+      st.currentTrip = {
+        startTime: new Date().toISOString(),
+        startLocation: placeName,
+        points: [],
+        fuelStart: fuelStartSnapshot,
+        liveDistanceKm: 0,
+        fatigueWarned: false,
+        obdVoltageStart: st.carState.obdVoltage ?? null,
+        obdTempStart: st.carState.coolantTemp ?? null,
+        obdRpmStart: st.carState.engineRpm ?? null
+      };
+      // 用回退坐标发地图链接（上次停车位置 or carState 缓存的 GPS）
+      const mapLat = fallbackLat ?? d.lat;
+      const mapLng = fallbackLng ?? d.lng;
+      // v6.25.1: 行程开始
+      resolve({ statusCode: 200, body: { ok: true } });
+    }
+    const timer = setTimeout(() => {
+      logWarn('handleStart timeout', 'reverseGeo did not callback');
+      const fl = (st.carState.lat && Math.abs(st.carState.lat) > 0.001) ? st.carState.lat : null;
+      const fng = (st.carState.lng && Math.abs(st.carState.lng) > 0.001) ? st.carState.lng : null;
+      done('未知', fl, fng);
+    }, 7000);
+    // 坐标为 (0,0) 时：用上次行程终点位置 + carState 缓存的 GPS 做回退
+    if (!USEABLE_COORDS) {
+      logWarn('handleStart', '坐标为(0,0)，尝试上次行程终点');
+      const lastTrip = st.tripHistory.slice(-1)[0];
+      const fallbackLoc = (lastTrip && lastTrip.endLocation && lastTrip.endLocation !== '未知')
+        ? '🅿️ ' + lastTrip.endLocation : '未知';
+      // carState 中上次 status 上报可能还有有效坐标
+      const fallbackLat = (st.carState.lat && Math.abs(st.carState.lat) > 0.001) ? st.carState.lat : null;
+      const fallbackLng = (st.carState.lng && Math.abs(st.carState.lng) > 0.001) ? st.carState.lng : null;
+      done(fallbackLoc, fallbackLat, fallbackLng);
+      return;
+    }
+    reverseGeo(d.lat, d.lng, (placeName) => done(placeName));
+  });
+}
+
+/** POST /api/car/end — 行程结束 */
+function handleEnd(bodyStr) {
+  const st = storage;
+  const d = JSON.parse(bodyStr);
+
+  if (!st.currentTrip.startTime) {
+    return { statusCode: 200, body: { ok: false, error: 'no active trip' } };
+  }
+  if (st.currentTrip._ending) {
+    return { statusCode: 200, body: { ok: false, error: 'already ending' } };
+  }
+  st.currentTrip._ending = true;
+  const trip = st.currentTrip;
+
+  // GPS 坐标校验：复用 handleStart 的回退逻辑
+  const USEABLE_COORDS = (Math.abs(d.lat) > 0.001 || Math.abs(d.lng) > 0.001);
+
+  return new Promise((resolve) => {
+    let resolved = false;
+    function done(endLoc) {
+      if (resolved) return; resolved = true;
+      clearTimeout(timer);
+      if (/^-?\d+\.\d+,-?\d+\.\d+$/.test(endLoc)) {
+        endLoc = trip.startLocation || '未知';
+      }
+      resolve(finishTrip(trip, endLoc, d.fuelConsumption || 0, d.odometer));
+    }
+    const timer = setTimeout(() => {
+      logWarn('handleEnd timeout', 'reverseGeo did not callback');
+      done(trip.startLocation || '未知');
+    }, 7000);
+
+    // 坐标 (0,0) 时跳过 Nominatim，用出发地名
+    if (!USEABLE_COORDS) {
+      logWarn('handleEnd', '坐标为(0,0)，跳过反向编码，用出发地名');
+      done(trip.startLocation || '未知');
+      return;
+    }
+    reverseGeo(d.lat, d.lng, (endLoc) => done(endLoc));
+  });
+}
+
+// ====== OBD PID 注册表 & 解析引擎 (VPS 侧唯一权威) ======
+// 手机端只负责发送原始 hex，解析逻辑全部集中在 VPS
+// 公式来源: SAE J1979 / ISO 15031-5
+
+// 从 hex 字符串提取原始数据字节
+function obdB(data, offset = 0) { const idx = offset * 2; return idx + 2 <= data.length ? parseInt(data.slice(idx, idx + 2), 16) : 0; }
+function obdW(data, offset = 0) { const idx = offset * 2; return idx + 4 <= data.length ? parseInt(data.slice(idx, idx + 2), 16) * 256 + parseInt(data.slice(idx + 2, idx + 4), 16) : 0; }
+
+const PID_REGISTRY = {
+  0x04: { key: 'engineLoad',   parse: d => obdB(d) / 2.55 },
+  0x05: { key: 'coolantTemp',  parse: d => obdB(d) - 40 },
+  0x06: { key: 'fuelTrimS1',   parse: d => (obdB(d) - 128) * 100 / 128 },
+  0x07: { key: 'fuelTrimL1',   parse: d => (obdB(d) - 128) * 100 / 128 },
+  0x0A: { key: 'fuelPressure', parse: d => obdB(d) * 3 },
+  0x0B: { key: 'intakeMAP',    parse: d => obdB(d) },
+  0x0C: { key: 'engineRpm',    parse: d => obdW(d) / 4 },
+  0x0D: { key: 'obdSpeed',     parse: d => obdB(d) },
+  0x0E: { key: 'timingAdv',    parse: d => (obdB(d) - 128) / 2 },
+  0x0F: { key: 'intakeTemp',   parse: d => obdB(d) - 40 },
+  0x10: { key: 'mafRate',      parse: d => obdW(d) / 100 },
+  0x11: { key: 'throttlePos',  parse: d => obdB(d) / 2.55 },
+  0x2F: { key: 'fuelLevel',    parse: d => obdB(d) / 2.55 },
+  0x33: { key: 'baroPressure', parse: d => obdB(d) },
+  0x42: { key: 'voltage',      parse: d => obdW(d) / 1000 },
+  0x43: { key: 'absLoad',      parse: d => obdW(d) / 2.55 },
+  0x44: { key: 'equivRatio',   parse: d => obdW(d) / 32768 },
+  0x5E: { key: 'fuelRate',     parse: d => obdW(d) * 0.05 },
+};
+
+// ====== 油量校准映射表 ======
+// 线性插值: 已知 (rawA→pctA), (rawB→pctB)，求 rawX 对应 pct
+// 例如 { "16":52, "255":100 } — 加满跳枪和用户读表喂的点
+function calibratedFuelLevel(rawByte) {
+  const map = storage.fuelLevelMap;
+  const keys = Object.keys(map).map(Number).sort((a,b)=>a-b);
+  if (keys.length === 0) return rawByte / 2.55; // 兜底: 标准 J1979
+
+  if (keys.length === 1) {
+    const k = keys[0];
+    return rawByte >= k ? map[k] : (rawByte / k * map[k]);
+  }
+
+  // 找到区间
+  for (let i = 0; i < keys.length - 1; i++) {
+    const a = keys[i], b = keys[i+1];
+    if (rawByte >= a && rawByte <= b) {
+      return map[a] + (rawByte - a) / (b - a) * (map[b] - map[a]);
+    }
+  }
+  // 区间外: 用最近点外推
+  if (rawByte < keys[0]) {
+    const a = keys[0], b = keys[1];
+    const slope = (map[b] - map[a]) / (b - a);
+    return Math.max(0, map[a] + (rawByte - a) * slope);
+  }
+  const a = keys[keys.length-2], b = keys[keys.length-1];
+  const slope = (map[b] - map[a]) / (b - a);
+  return Math.min(100, map[b] + (rawByte - b) * slope);
+}
+
+// ====== 滚动油耗窗口 (续航计算) ======
+const { TANK_CAPACITY, DISPLACEMENT_L, FUEL_CALIB_COEFF } = config;
+if (!TANK_CAPACITY) throw new Error('config.TANK_CAPACITY 未设置');
+
+// 每 ~1km 产一个油耗样本 (L/100km)
+function addFuelSample(odoKm, fuelCons) {
+  const samples = storage.fuelSamples;
+  const last = samples.length > 0 ? samples[samples.length-1] : null;
+  if (!last || odoKm - last.km >= 0.5) {
+    samples.push({ km: odoKm, fuel: fuelCons });
+    if (samples.length > 30) samples.shift(); // 只保留最近 ~30km
+  }
+}
+
+// 滚动加权平均: 越新的样本权重越高
+function rollingAvgFuelPer100km() {
+  const samples = storage.fuelSamples;
+  if (samples.length < 2) {
+    // 没样本: 用全局平均兜底 (至少跑了 5km 才算)
+    const odo = storage.carState._totalOdoKm || 0;
+    if (odo < 5) return null;
+    const cons = storage.carState.fuelConsumption || 0;
+    return cons / odo * 100;
+  }
+  let sumW = 0, sumV = 0;
+  for (let i = 0; i < samples.length; i++) {
+    if (i === 0) continue; // 第一个点没前驱
+    const dKm = samples[i].km - samples[i-1].km;
+    const dFuel = samples[i].fuel - samples[i-1].fuel;
+    if (dKm < 0.1) continue;
+    const v = dFuel / dKm * 100; // L/100km for this segment
+    const w = (i + 1) / samples.length; // 线性权重: 越新越重
+    sumW += w; sumV += v * w;
+  }
+  return sumW > 0 ? sumV / sumW : 8.0; // 兜底 8 L/100km
+}
+
+function calcRange(fuelLevelPct, avgFuelPer100km) {
+  if (!avgFuelPer100km || avgFuelPer100km <= 0) return null;  // 无数据不显示
+  const fuelRemaining = TANK_CAPACITY * (fuelLevelPct / 100);
+  return fuelRemaining / avgFuelPer100km * 100;
+}
+
+function getTripDuration() {
+  const trip = storage.currentTrip;
+  if (!trip.startTime) return '--';
+  const ms = Date.now() - new Date(trip.startTime).getTime();
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  return (h > 0 ? h + 'h' : '') + String(m).padStart(2, '0') + 'min';
+}
+
+/** POST /api/car/obd — OBD 数据中继 (v5: 支持 raw hex 和旧版 key-value) */
+function handleObd(bodyStr) {
+  const st = storage;
+  const d = JSON.parse(bodyStr);
+
+  // 存储 OBD 中继日志到 logs/ 目录 (手机端 diag 上传)
+  if (d._log && typeof d._log === 'string') {
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const logPath = path.join(config.LOG_DIR, `obd_relay_${today}.log`);
+      const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+      fs.appendFileSync(logPath, `\n=== ${ts} ===\n${d._log}\n`);
+      delete d._log;
+    } catch(e) { logWarn('obdLog write error', e.message); }
+  }
+
+  st.carState.obdData = st.carState.obdData || {};
+
+  // v6.25.1 扫描期: 手机端发原始 ELM327 响应, 摸底 ECU 支持的 PID
+  if (d._type === "debug_raw") {
+    const pid = d.pid;
+    const resp = d.resp || '';
+    const isRejected = resp.includes('7F');
+    st._pidScan = st._pidScan || {};
+    if (!st._pidScan[pid]) st._pidScan[pid] = { ok: 0, fail: 0, lastResp: '' };
+    if (isRejected) {
+      st._pidScan[pid].fail++;
+      st._pidScan[pid].lastResp = resp.slice(0, 60);
+    }
+    // don't log every single 7F — only log on first discovery and every 30th
+    if (isRejected && st._pidScan[pid].fail === 1) {
+      logInfo(`❌ PID 0x${pid?.toString(16)?.toUpperCase()}`, `不支持 (7F)`);
+    }
+    if (!isRejected) {
+      // shouldn't happen since raw dispatches go through _type="raw"
+    }
+    delete d._type; delete d.pid; delete d.resp; delete d.loop;
+  }
+
+  // v5: 手机端发送 raw hex 格式 {"_type":"raw","0C":"410C1BA4","0D":"410D3C",...}
+  // 带 ELM327 响应前缀 "41XX"，VPS 裁剪后解析
+  if (d._type === 'raw') {
+    delete d._type;
+    for (const [pidHex, hexRaw] of Object.entries(d)) {
+      if (pidHex === 'apiKey' || pidHex.startsWith('_')) continue;
+      const pid = parseInt(pidHex, 16);
+      const def = PID_REGISTRY[pid];
+      if (!def) continue;
+      // 裁剪 "41XX" 前缀 (4字符) → 纯数据 hex
+      const data = hexRaw.length > 4 ? hexRaw.slice(4) : hexRaw;
+      const val = def.parse(data);
+      // 扫描期: 记录所有 PID 原始 hex 用于摸底
+      logInfo(`PID_RAW 0x${pidHex}`, `hexRaw="${hexRaw}" data="${data}" val=${val}`);
+      // 标记 PID 可用
+      st._pidScan = st._pidScan || {};
+      if (!st._pidScan[pid]) st._pidScan[pid] = { ok: 0, fail: 0, lastResp: '' };
+      st._pidScan[pid].ok++;
+      st.carState.obdData[def.key] = val;
+    }
+  } else {
+    // 旧版兼容: 手机端发已解析的 key-value {"engineRpm":1769,...}
+    for (const [k, v] of Object.entries(d)) {
+      if (k === 'type' || k === 'apiKey' || k.startsWith('_')) continue;
+      st.carState.obdData[k] = v;
+    }
+  }
+
+  // 每 10 次记录一行调试日志
+  st.carState._obdCount = (st.carState._obdCount || 0) + 1;
+  if (st.carState._obdCount % 10 === 1) {
+    const keys = Object.keys(st.carState.obdData);
+    logInfo('OBD接收', keys.join(' ') + ' #' + st.carState._obdCount);
+  }
+
+  // 同步到顶层字段 & 油耗积分
+  const od = st.carState.obdData;
+  if (od.voltage !== undefined) st.carState.obdVoltage = od.voltage;
+  if (od.coolantTemp !== undefined) st.carState.coolantTemp = od.coolantTemp;
+  if (od.engineRpm !== undefined) st.carState.engineRpm = od.engineRpm;
+  if (od.obdSpeed !== undefined) {
+    // 低通滤波平滑 (EMA α=0.35)，消起步跳变感
+    if (st._smoothSpeed === undefined) st._smoothSpeed = od.obdSpeed;
+    st._smoothSpeed = st._smoothSpeed * 0.65 + od.obdSpeed * 0.35;
+    st.carState.obdSpeed = Math.round(st._smoothSpeed * 10) / 10;
+  }
+  // 油耗率计算: MAF优先 → ECU直读(0x5E) → 负荷×转速估算
+  if (od.mafRate !== undefined && od.mafRate > 0) {
+    // 🎯 最准: MAF(g/s) ÷ 14.7 ÷ 737 = L/h  (737g是1升汽油质量)
+    st.carState.fuelRate = od.mafRate / 14.7 / 737 * 3600;
+  } else if (od.fuelRate !== undefined) {
+    st.carState.fuelRate = od.fuelRate;
+  } else if (od.engineLoad !== undefined && od.engineRpm !== undefined) {
+    // 兜底: 负荷×转速×排量×系数
+    st.carState.fuelRate = (od.engineLoad / 100) * od.engineRpm * DISPLACEMENT_L * FUEL_CALIB_COEFF;
+  }
+  if (st.carState.fuelRate !== undefined && st.carState.obdLastSeen) {
+    const dtH = (Date.now() - new Date(st.carState.obdLastSeen).getTime()) / 3600000;
+    if (dtH > 0 && dtH < 0.01) {
+      st.carState.fuelConsumption += st.carState.fuelRate * dtH;
+      const odo = st.carState._totalOdoKm || 0;
+      addFuelSample(odo, st.carState.fuelConsumption);
+    }
+  }
+  // 油量: 由累计油耗反推 (0x2F 不支持, 无OBD直读)
+  // 加油后累计油耗归零, fuelLevel 回到 100%
+  const cons = st.carState.fuelConsumption || 0;
+  st.carState.fuelLevel = Math.max(0, (TANK_CAPACITY - cons) / TANK_CAPACITY * 100);
+  const carSpeed = st.carState.obdSpeed ?? st.carState.speed ?? 0;
+
+  // === 行程以 ECU 连接/断开为界 ===
+  // ECU连上且未在行程中 → 自动开始
+  if (!st.currentTrip.startTime) {
+    const now = new Date().toISOString();
+    st.currentTrip.startTime = now;
+    st.currentTrip.points = [];
+    st.currentTrip.liveDistanceKm = 0;
+    st.currentTrip.startLocation = 'ECU连接';
+    st.currentTrip.fatigueWarned = false;
+    st.currentTrip._lock = false;
+    st.currentTrip._ending = false;
+    st.currentTrip.fuelStart = st.carState.fuelConsumption || 0;
+    st.currentTrip.obdVoltageStart = st.carState.obdVoltage ?? null;
+    st.currentTrip.obdTempStart = st.carState.coolantTemp ?? null;
+    st.currentTrip.obdRpmStart = st.carState.engineRpm ?? null;
+    logInfo('行程开始(ECU连接)', `fuelStart=${st.currentTrip.fuelStart?.toFixed(2)}L 油量=${(st.carState.fuelLevel||0).toFixed(1)}%`);
+  }
+  // === OBD 车速累计里程 (替代 GPS 轨迹) ===
+  if (st.currentTrip.startTime && carSpeed > 0 && st.carState._prevObdMs) {
+    const dtH = (Date.now() - st.carState._prevObdMs) / 3600000;
+    if (dtH > 0 && dtH < 0.01) {  // < 36秒, 防大跳
+      const seg = carSpeed * dtH;
+      st.currentTrip.liveDistanceKm = (st.currentTrip.liveDistanceKm || 0) + seg;
+      st.carState._totalOdoKm = (st.carState._totalOdoKm || 0) + seg;
+    }
+  }
+  st.carState._prevObdMs = Date.now();
+
+  // === 瞬时油耗 (行进: L/100km, 怠速: L/h 分情景) ===
+  const fuelRate = st.carState.fuelRate;
+  const coolantT = st.carState.coolantTemp;
+  const engLoad = od.engineLoad;
+  const rpm = st.carState.engineRpm;
+
+  if (fuelRate !== undefined && carSpeed > 1) {
+    // 行进中: L/100km
+    st.carState.fuelPer100km = Math.round((fuelRate / carSpeed) * 100 * 100) / 100;
+  } else if (fuelRate !== undefined && rpm !== undefined && rpm > 0) {
+    // 怠速/低速: L/h, 根据工况微调
+    // 基准值: fuelRate 本身已是 L/h (燃料率, L/h)
+    // hotIdle 基准 = fuelRate × 1.0 (发动机负荷已反映真实油耗)
+    const baseFuelLph = fuelRate;  // L/h, 已经由负荷×转速算出
+    let fuelLph = baseFuelLph;
+    let scenario = '怠速';
+
+    // 冷车 (<50°C): 加浓 ~ +40%
+    if (coolantT != null && coolantT < 50) {
+      fuelLph = baseFuelLph * 1.4;
+      scenario = '冷车怠速';
+    } else if (coolantT != null && engLoad != null && engLoad > 22) {
+      // 热车高负荷 (开空调/用电): +20%
+      fuelLph = baseFuelLph * 1.2;
+      scenario = '热车+空调';
+    }
+    // else: 热车怠速 (基准), fuelLph = baseFuelLph
+
+    st.carState.fuelPer100km = Math.round(fuelLph * 100) / 100; // 单位: L/h
+    st.carState._idleScenario = scenario;
+  } else {
+    st.carState.fuelPer100km = null;
+  }
+  st.carState.obdState = 'polling';
+  st.carState.obdAttempted = true;
+  st.carState.obdSkipReason = null;
+  st.carState.obdLastSeen = new Date().toISOString();
+  st._ecuLastDataMs = Date.now();  // ECU 活跃时间戳
+
+  // 疲劳驾车时 pushFatigueAlert 会写入 _carNotify，由 /api/query/state 消费
+  // 此处仅回传已有通知（不删除），车机轮询 /api/query/state 才是唯一消费点
+  const carNotify = st.carState._carNotify ?? null;
+  return { statusCode: 200, body: { ok: true, carNotify: carNotify } };
+}
+
+/** POST /api/car/alert — 自定义提醒 */
+function handleAlert(bodyStr) {
+  const d = JSON.parse(bodyStr);
+  // v6.25.1: 自定义提醒仅记录，不推送微信
+  logInfo('ALERT', (d.message || '自定义提醒').substring(0, 50));
+  return { statusCode: 200, body: { ok: true } };
+}
+
+/** POST /api/car/diag — 诊断数据接收 */
+function handleDiag(bodyStr) {
+  const d = JSON.parse(bodyStr);
+  const label = (d.label || '诊断').replace(/[^a-zA-Z0-9_\u4e00-\u9fff\-]/g, '_');
+  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const diagPath = path.join(config.DIAG_DIR, `diag_${label}.txt`);
+  const header = `=== ${label} | ${d.device || '?'} | Android ${d.android || '?'} | ${ts} ===`;
+  try {
+    if (!fs.existsSync(config.DIAG_DIR)) fs.mkdirSync(config.DIAG_DIR, { recursive: true });
+    fs.writeFileSync(diagPath, header + '\n' + (d.output || ''), 'utf8');
+    logInfo('CarDiag接收', `${label} | ${d.device} | ${(d.output||'').length}字符`);
+    return { statusCode: 200, body: { ok: true } };
+  } catch(e) {
+    logWarn('diag write error', e.message);
+    return { statusCode: 200, body: { ok: false, error: e.message } };
+  }
+}
+
+// ====== 行程超时自动结束 ======
+
+let _timeoutCheckerInterval = null;
+
+/** 启动定时器：每分钟检查行程是否超时（30分钟无GPS更新自动结束） */
+function startTripTimeoutChecker() {
+  if (_timeoutCheckerInterval) return; // 防止重复启动
+
+  _timeoutCheckerInterval = setInterval(() => {
+    const st = storage;
+    // 没有活跃行程 或 正在结束中 → 跳过
+    if (!st.currentTrip.startTime || st.currentTrip._ending) return;
+    // 没有 GPS 更新时间 → 跳过
+    if (!st.carState.lastGpsUpdate) return;
+
+    const idleMs = Date.now() - new Date(st.carState.lastGpsUpdate).getTime();
+    if (idleMs >= config.TRIP_TIMEOUT_MS) {
+      logInfo('行程超时',
+        Math.floor(idleMs / 60000) + '分钟无GPS更新，自动结束行程');
+      st.currentTrip._ending = true;
+      const trip = st.currentTrip;
+      const endLoc = trip.points.length > 0 ? trip.startLocation : '未知';
+
+      // 超时结束 — 先计算统计，再推送
+      const stats = calcStats(trip, st.carState.fuelConsumption || 0);
+      if (stats) {
+        stats.date = new Date().toISOString();
+        stats.startLocation = trip.startLocation;
+        stats.endLocation = endLoc;
+        st.tripHistory.push(stats);
+        if (st.tripHistory.length > 100) st.tripHistory = st.tripHistory.slice(-100);
+        updateStats(stats);
+       // v6.25.1: 超时结束 不推送
+      }
+      st.saveData();
+      delete st.currentTrip._ending;
+      st.currentTrip = {
+        startTime: null, startLocation: '', points: [],
+        fuelStart: 0, fatigueWarned: false,
+        obdVoltageStart: null, obdTempStart: null, obdRpmStart: null
+      };
+    }
+  }, config.TRIP_TIMEOUT_CHECK_MS);
+
+  logInfo('行程超时检测已启动',
+    '间隔=' + (config.TRIP_TIMEOUT_CHECK_MS / 1000) + 's 超时=' + (config.TRIP_TIMEOUT_MS / 60000) + 'min');
+
+  // === ECU 断开/重连检测 ===
+  const ECU_TIMEOUT_MS = 30_000;      // 30秒无 OBD 数据 → 判定 ECU 断开
+  const ECU_WATCH_MS = 15_000;        // 每 15 秒检查一次
+  let _ecuWatcherInterval = setInterval(() => {
+    const last = storage._ecuLastDataMs || 0;
+    const gap = Date.now() - last;
+    const wasDisconnected = storage._ecuDisconnected === true;
+
+    if (gap >= ECU_TIMEOUT_MS && !wasDisconnected) {
+      // ECU 刚断开 → 结束当前行程 + 记录快照
+      storage._ecuDisconnected = true;
+      storage._ecuSnapshot = {
+        disconnectedAt: new Date().toISOString(),
+        fuelConsumption: storage.carState.fuelConsumption,
+        fuelLevel: storage.carState.fuelLevel,
+        engineRpm: storage.carState.engineRpm ?? null,
+        obdSpeed: storage.carState.obdSpeed ?? 0,
+        coolantTemp: storage.carState.coolantTemp ?? null,
+        _desc: 'ECU 断开前最后数据'
+      };
+
+      // 结束当前行程
+      if (storage.currentTrip.startTime && !storage.currentTrip._ending) {
+        const trip = storage.currentTrip;
+        storage.currentTrip._ending = true;
+        finishTrip(trip, 'ECU断开', 0, 0);
+      }
+
+      logInfo('🔌 ECU断开', `油耗= ${storage._ecuSnapshot.fuelConsumption?.toFixed(2)}L ` +
+        `油量=${storage._ecuSnapshot.fuelLevel?.toFixed(1)}% ` +
+        `转速=${storage._ecuSnapshot.engineRpm}rpm 车速=${storage._ecuSnapshot.obdSpeed}km/h`);
+    } else if (gap < ECU_TIMEOUT_MS && wasDisconnected && storage._ecuSnapshot) {
+      // ECU 重连 → 对比
+      const snap = storage._ecuSnapshot;
+      const now = storage.carState;
+      const fuelConsumed = (now.fuelConsumption || 0) - (snap.fuelConsumption || 0);
+      const levelChange = (now.fuelLevel || 0) - (snap.fuelLevel || 0);
+      logInfo('🔗 ECU重连',
+        `断开前油量=${snap.fuelLevel?.toFixed(1)}% ` +
+        `现在=${now.fuelLevel?.toFixed(1)}% ` +
+        `差值=${levelChange.toFixed(1)}% ` +
+        `离线油耗=${Math.abs(fuelConsumed).toFixed(2)}L ` +
+        (snap._desc || ''));
+      storage._ecuSnapshot._reconnectedAt = new Date().toISOString();
+      storage._ecuSnapshot._deltaFuelConsumed = fuelConsumed;
+      storage._ecuSnapshot._deltaFuelLevel = levelChange;
+      storage._ecuDisconnected = false;
+    }
+  }, ECU_WATCH_MS);
+  logInfo('ECU断开检测已启动', `超时=${ECU_TIMEOUT_MS/1000}s 检查=${ECU_WATCH_MS/1000}s`);
+}
+
+// ====== 加油重置 ======
+
+function refuel() {
+  const st = storage.carState;
+  st.fuelConsumption = 0;
+  st.fuelLevel = 100;
+  st._fuelLevelRaw = 0;
+  storage.saveData();
+  logInfo('⛽ 加油重置', '油耗归零, 油量→100%');
+  return { statusCode: 200, body: { fuelLevel: 100, fuelConsumption: 0 } };
+}
+
+module.exports = {
+  handleStatus, handleStart, handleEnd, handleObd,
+  // 工具函数 (供 server.js 调用)
+  calibratedFuelLevel, addFuelSample, rollingAvgFuelPer100km, calcRange, getTripDuration,
+  handleAlert, handleDiag, finishTrip,
+  calcStats, updateStats, getTripsForPeriod,
+  startTripTimeoutChecker, refuel
+};
+
+──────────────────────────────────────────────────────────
+文件: carbridge/ecosystem.config.js
+──────────────────────────────────────────────────────────
+// CarBridge v6.25.1 — PM2 进程管理配置 (MIT License)
+// ======================================================
+// 开源版使用相对路径, 生产部署改成绝对路径
+// 部署: cd carbridge && pm2 start ecosystem.config.js
+// 或:   pm2 start server.js --name carbridge
+
+module.exports = {
+  apps: [{
+    name: 'carbridge',
+    script: './server.js',
+    cwd: __dirname,
+    watch: false,
+    max_restarts: 20,
+    restart_delay: 3000,
+    log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+    error_file: './logs/pm2-error.log',
+    out_file: './logs/pm2-out.log',
+    env: {
+      NODE_ENV: 'production'
+    }
+  }]
+};
+
+
+═══════════════════════════════════════════════════════════════
+三、CarAgent 车机端
+═══════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/AndroidManifest.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application android:usesCleartextTraffic="true"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.CarAgent">
+
+        <activity
+            android:name="com.carbridge.agent.MainActivity"
+            android:configChanges="uiMode|screenSize|orientation"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name="com.carbridge.agent.ConfigActivity"
+            android:configChanges="uiMode|screenSize|orientation"
+            android:exported="true"
+            android:label="@string/config_title" />
+
+        <service
+            android:name="com.carbridge.agent.CarAgentService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+
+        <receiver
+            android:name="com.carbridge.agent.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/java/com/carbridge/agent/MainActivity.kt
+──────────────────────────────────────────────────────────
+package com.carbridge.agent
+
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.*
+import java.util.concurrent.Executors
+
+class MainActivity : AppCompatActivity() {
+
+    data class CellCfg(val label: String, val unit: String, val valueTag: String, val bind: (TextView) -> Unit)
+
+    // === 配色方案 ===
+    data class Palette(
+        val bg: String, val card: String, val cardStroke: String,
+        val textPri: String, val textSec: String, val textDim: String,
+        val accent: String, val green: String, val yellow: String, val cyan: String,
+        val speed: String, val status: String
+    )
+
+    private val DAY = Palette(
+        bg = "#ECF0F3", card = "#FFFFFF", cardStroke = "#DDE1E5",
+        textPri = "#1A1C1E", textSec = "#546E7A", textDim = "#90A4AE",
+        accent = "#1565C0", green = "#2E7D32", yellow = "#E65100", cyan = "#00695C",
+        speed = "#0D47A1", status = "#1565C0"
+    )
+    private val NIGHT = Palette(
+        bg = "#0B0E14", card = "#161B22", cardStroke = "#21262D",
+        textPri = "#E6EDF3", textSec = "#7D8590", textDim = "#484F58",
+        accent = "#58A6FF", green = "#3FB950", yellow = "#D29922", cyan = "#39D2C0",
+        speed = "#79C0FF", status = "#4FC3F7"
+    )
+
+    private var palette = NIGHT
+    private var lastMode = true
+    private var vpsIsNight: Boolean? = null
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val httpThread = Executors.newSingleThreadExecutor { r -> Thread(r, "Http").also { it.isDaemon = true } }
+
+    private lateinit var root: LinearLayout
+    private lateinit var tvStatus: TextView
+    private lateinit var tvDateTime: TextView
+    private lateinit var tvLunar: TextView
+    private lateinit var tvSpeed: TextView
+    private lateinit var tvSpeedUnit: TextView
+    private lateinit var tvRpm: TextView
+    private lateinit var tvCoolant: TextView
+    private lateinit var tvLoad: TextView
+    private lateinit var tvFuelLvl: TextView
+    private lateinit var tvFuelInst: TextView
+    private lateinit var tvRange: TextView
+    private lateinit var tvTripD: TextView
+    private lateinit var tvTripT: TextView
+    private lateinit var tvTripC: TextView
+    private lateinit var tvDayD: TextView
+    private lateinit var tvDayC: TextView
+    private lateinit var tvMonD: TextView
+    private lateinit var tvMonC: TextView
+
+    private var polling = true
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        createNotifyChannel()
+        requestPermissions()
+        buildUI()
+        startPolling()
+        startDayNightWatcher()
+    }
+
+    // P2修复: 清除所有回调防内存泄漏 + 断开悬空HTTP连接
+    override fun onDestroy() {
+        super.onDestroy()
+        polling = false
+        pendingConn?.let { try { it.disconnect() } catch (_: Exception) {} }
+        handler.removeCallbacksAndMessages(null)
+    }
+
+    // ====== 农历 (零依赖, 1900-2100) ======
+
+    companion object {
+        // 农历年信息编码: 低12位=月大小(1=30天,0=29天), 高4位=闰月(0=无闰)
+        // 位序: bit10=正月, bit0=十一月? No. 标准: bit11=正月(第1个月), bit0=十二月(第12个月)
+        // 简便方案: 低12位从正月到十二月, MSB first 还是 LSB first?
+        // 采用常见编码: 低4位=闰月(0=无), bit4..15=月大小(bit4=正月...bit15=十二月)
+        // 实际上用更简单的: info & 0xf = 闰月, (info >> 4) & 0xfff = 12个月大小(bit0=正月)
+        private val LUNAR_INFO = intArrayOf(
+            // 1900-1909
+            0x04bd8, 0x04ae0, 0x0a570, 0x054d5, 0x0d260, 0x0d950, 0x16554, 0x056a0, 0x09ad0, 0x055d2,
+            // 1910-1919
+            0x04ae0, 0x0a5b6, 0x0a4d0, 0x0d250, 0x1d255, 0x0b540, 0x0d6a0, 0x0ada2, 0x095b0, 0x14977,
+            // 1920-1929
+            0x04970, 0x0a4b0, 0x0b4b5, 0x06a50, 0x06d40, 0x1ab54, 0x02b60, 0x09570, 0x052f2, 0x04970,
+            // 1930-1939
+            0x06566, 0x0d4a0, 0x0ea50, 0x16a95, 0x05ad0, 0x02b60, 0x186e3, 0x092e0, 0x1c8d7, 0x0c950,
+            // 1940-1949
+            0x0d4a0, 0x1d8a6, 0x0b550, 0x056a0, 0x1a5b4, 0x025d0, 0x092d0, 0x0d2b2, 0x0a950, 0x0b557,
+            // 1950-1959
+            0x06ca0, 0x0b550, 0x15355, 0x04da0, 0x0a5b0, 0x14573, 0x052b0, 0x0a9a8, 0x0e950, 0x06aa0,
+            // 1960-1969
+            0x0aea6, 0x0ab50, 0x04b60, 0x0aae4, 0x0a570, 0x05260, 0x0f263, 0x0d950, 0x05b57, 0x056a0,
+            // 1970-1979
+            0x096d0, 0x04dd5, 0x04ad0, 0x0a4d0, 0x0d4d4, 0x0d250, 0x0d558, 0x0b540, 0x0b6a0, 0x195a6,
+            // 1980-1989
+            0x095b0, 0x049b0, 0x0a974, 0x0a4b0, 0x0b27a, 0x06a50, 0x06d40, 0x0af46, 0x0ab60, 0x09570,
+            // 1990-1999
+            0x04af5, 0x04970, 0x064b0, 0x074a3, 0x0ea50, 0x06b58, 0x05ac0, 0x0ab60, 0x096d5, 0x092e0,
+            // 2000-2009
+            0x0c960, 0x0d954, 0x0d4a0, 0x0da50, 0x07552, 0x056a0, 0x0abb7, 0x025d0, 0x092d0, 0x0cab5,
+            // 2010-2019
+            0x0a950, 0x0b4a0, 0x0baa4, 0x0ad50, 0x055d9, 0x04ba0, 0x0a5b0, 0x15176, 0x052b0, 0x0a930,
+            // 2020-2029
+            0x07954, 0x06aa0, 0x0ad50, 0x05b52, 0x04b60, 0x0a6e6, 0x0a4e0, 0x0d260, 0x0ea65, 0x0d530,
+            // 2030-2039
+            0x05aa0, 0x076a3, 0x096d0, 0x04afb, 0x04ad0, 0x0a4d0, 0x1d0b6, 0x0d250, 0x0d520, 0x0dd45,
+            // 2040-2049
+            0x0b5a0, 0x056d0, 0x055b2, 0x049b0, 0x0a577, 0x0a4b0, 0x0aa50, 0x1b255, 0x06d20, 0x0ada0,
+            // 2050-2059
+            0x14b63, 0x09370, 0x049f8, 0x04970, 0x064b0, 0x168a6, 0x0ea50, 0x06aa0, 0x1a6c4, 0x0aae0,
+            // 2060-2069
+            0x092e0, 0x0d2e3, 0x0c960, 0x0d557, 0x0d4a0, 0x0da50, 0x05d55, 0x056a0, 0x0a6d0, 0x055d4,
+            // 2070-2079
+            0x052d0, 0x0a9b8, 0x0a950, 0x0b4a0, 0x0b6a6, 0x0ad50, 0x055a0, 0x0aba4, 0x0a5b0, 0x052b0,
+            // 2080-2089
+            0x0b273, 0x06930, 0x07337, 0x06aa0, 0x0ad50, 0x14b55, 0x04b60, 0x0a570, 0x054e4, 0x0d160,
+            // 2090-2099
+            0x0e968, 0x0d520, 0x0daa0, 0x16aa6, 0x056d0, 0x04ae0, 0x0a9d4, 0x0a4d0, 0x0d150, 0x0f252
+        )
+
+        private val HEAVENLY_STEMS = arrayOf("甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸")
+        private val EARTHLY_BRANCHES = arrayOf("子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥")
+        private val LUNAR_MONTHS = arrayOf("正", "二", "三", "四", "五", "六", "七", "八", "九", "十", "冬", "腊")
+        private val LUNAR_DAYS = arrayOf(
+            "初一","初二","初三","初四","初五","初六","初七","初八","初九","初十",
+            "十一","十二","十三","十四","十五","十六","十七","十八","十九","二十",
+            "廿一","廿二","廿三","廿四","廿五","廿六","廿七","廿八","廿九","三十"
+        )
+
+        private val BASE_YEAR = 1900
+        private val BASE_DAYS = 49 // 1900-01-31 是农历正月初一, 1900-01-01 距正月初一的天数
+        // 1900-01-01 到 1900-01-31 = 30天, 但公历1月31日是正月初一。实测需要从1900-01-01偏移。
+
+        fun lunarDate(cal: Calendar): String {
+            // P1修复: 范围校验防系统时间异常导致 ArrayIndexOutOfBounds
+            val year = cal.get(Calendar.YEAR)
+            val index = year - BASE_YEAR
+            if (index < 0 || index >= LUNAR_INFO.size) return "未知农历"
+            // 计算距 1900-01-01 的天数
+            val days = daysBetween(BASE_YEAR, 1, 1, year, cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH))
+
+            var lunarYear = BASE_YEAR
+            var offset = days
+            // 跳过农历年
+            while (lunarYear < 2101) {
+                val yearDays = lunarYearDays(lunarYear)
+                if (offset < yearDays) break
+                offset -= yearDays
+                lunarYear++
+            }
+            if (lunarYear > 2100) lunarYear = 2100
+
+            // 月份
+            val leapMonth = LUNAR_INFO[lunarYear - BASE_YEAR] and 0xf
+            var month = 0
+            var isLeap = false
+            while (month < 12) {
+                val leap = (leapMonth > 0 && month + 1 == leapMonth && !isLeap)
+                val mDays = if (leap) lunarLeapDays(lunarYear) else lunarMonthDays(lunarYear, month + 1)
+                if (offset < mDays) {
+                    isLeap = leap
+                    break
+                }
+                offset -= mDays
+                month++
+                if (leap && !isLeap) month-- // 重试闰月
+            }
+            month++
+            val day = offset + 1
+
+            val stem = HEAVENLY_STEMS[(lunarYear - 4) % 10]
+            val branch = EARTHLY_BRANCHES[(lunarYear - 4) % 12]
+            val yearName = "$stem$branch"
+            val monthName = (if (isLeap) "闰" else "") + LUNAR_MONTHS[month - 1]
+            return "$yearName\u5E74 $monthName\u6708${LUNAR_DAYS[day - 1]}"
+        }
+
+        private fun daysBetween(y1: Int, m1: Int, d1: Int, y2: Int, m2: Int, d2: Int): Int {
+            val c1 = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply { set(y1, m1-1, d1, 0, 0, 0) }
+            val c2 = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply { set(y2, m2-1, d2, 0, 0, 0) }
+            return ((c2.timeInMillis - c1.timeInMillis) / 86400000).toInt()
+        }
+
+        private fun lunarYearDays(y: Int): Int {
+            var sum = 348 // 12 * 29
+            for (i in 0 until 12) {
+                if (((LUNAR_INFO[y - BASE_YEAR] shr (16 - i)) and 1) == 1) sum++
+            }
+            sum += lunarLeapDays(y)
+            return sum
+        }
+
+        private fun lunarLeapDays(y: Int): Int {
+            val leap = LUNAR_INFO[y - BASE_YEAR] and 0xf
+            return if (leap == 0) 0 else if (((LUNAR_INFO[y - BASE_YEAR] shr 4) and 1) == 1) 30 else 29
+        }
+
+        private fun lunarMonthDays(y: Int, m: Int): Int {
+            return if ((LUNAR_INFO[y - BASE_YEAR] shr (16 - m) and 1) == 1) 30 else 29
+        }
+    }
+
+    // ====== 日/夜切换 ======
+
+    private fun startDayNightWatcher() {
+        handler.post(object : Runnable {
+            override fun run() {
+                checkDayNight()
+                handler.postDelayed(this, 30_000L)
+            }
+        })
+    }
+
+    private fun checkDayNight() {
+        val uiMode = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        val isNight = when (uiMode) {
+            Configuration.UI_MODE_NIGHT_YES -> true
+            Configuration.UI_MODE_NIGHT_NO -> false
+            else -> vpsIsNight ?: run {
+                val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+                h < 6 || h >= 18
+            }
+        }
+        if (isNight != lastMode) {
+            lastMode = isNight
+            palette = if (isNight) NIGHT else DAY
+            applyTheme()
+        }
+    }
+
+    private fun applyTheme() {
+        root.setBackgroundColor(Color.parseColor(palette.bg))
+        tvStatus.setTextColor(Color.parseColor(palette.status))
+        tvDateTime.setTextColor(Color.parseColor(palette.textDim))
+        tvLunar.setTextColor(Color.parseColor(palette.textSec))
+        tvSpeed.setTextColor(Color.parseColor(palette.speed))
+        tvSpeedUnit.setTextColor(Color.parseColor(palette.textSec))
+        applyColors(root)
+    }
+
+    private fun applyColors(parent: ViewGroup) {
+        for (i in 0 until parent.childCount) {
+            val v = parent.getChildAt(i)
+            if (v is TextView) {
+                when (v.tag as? String ?: "") {
+                    "label" -> v.setTextColor(Color.parseColor(palette.textSec))
+                    "unit" -> v.setTextColor(Color.parseColor(palette.textDim))
+                    "green" -> v.setTextColor(Color.parseColor(palette.green))
+                    "yellow" -> v.setTextColor(Color.parseColor(palette.yellow))
+                    "cyan" -> v.setTextColor(Color.parseColor(palette.cyan))
+                    "accent" -> v.setTextColor(Color.parseColor(palette.accent))
+                    "value" -> v.setTextColor(Color.parseColor(palette.textPri))
+                }
+            }
+            if (v is ViewGroup) {
+                if (v.tag == "card") {
+                    val gd = v.background as? GradientDrawable
+                    gd?.setColor(Color.parseColor(palette.card))
+                    gd?.setStroke(dp(1), Color.parseColor(palette.cardStroke))
+                }
+                applyColors(v)
+            }
+        }
+    }
+
+    // ====== UI 构建 ======
+
+    private fun buildUI() {
+        palette = if (lastMode) NIGHT else DAY
+
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor(palette.bg))
+            isVerticalScrollBarEnabled = false
+        }
+
+        root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(14))
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+
+        // ── 顶栏: 日期时间 · 连接状态 ──
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) }
+        }
+        tvDateTime = label("", palette.textDim, 12f).apply { gravity = Gravity.CENTER }
+        topBar.addView(tvDateTime)
+        tvLunar = label("", palette.textSec, 12f)
+        tvStatus = label("⏳ 等待数据", palette.status, 12f).apply { typeface = Typeface.DEFAULT_BOLD }
+        val statusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER
+        }
+        statusRow.addView(tvLunar)
+        statusRow.addView(label(" · ", palette.textDim, 12f))
+        statusRow.addView(tvStatus)
+        topBar.addView(statusRow)
+        root.addView(topBar)
+
+        // ── 大车速卡片 (居中) ──
+        val speedCard = cardView().apply { setPadding(dp(20), dp(12), dp(20), dp(12)) }
+        val speedInner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+        }
+        tvSpeed = valueText("--", palette.speed, 64f).apply {
+            typeface = Typeface.defaultFromStyle(Typeface.BOLD)
+            tag = "speed"; gravity = Gravity.CENTER
+        }
+        speedInner.addView(tvSpeed)
+        tvSpeedUnit = label("km/h", palette.textSec, 13f)
+        speedInner.addView(tvSpeedUnit)
+        speedCard.addView(speedInner)
+        root.addView(speedCard)
+        root.addView(gap(8))
+
+        // ── 三列: 转速 / 水温 / 负荷 ──
+        root.addView(tripleRow(
+            CellCfg("转速", "rpm", "value", { tvRpm = it }),
+            CellCfg("水温", "°C", "value", { tvCoolant = it }),
+            CellCfg("负荷", "%", "value", { tvLoad = it })
+        ))
+        root.addView(gap(6))
+
+        // ── 三列: 油量 / 瞬时油耗 / 续航 ──
+        root.addView(tripleRow(
+            CellCfg("油量", "%", "value", { tvFuelLvl = it }),
+            CellCfg("瞬时油耗", "", "cyan", { tvFuelInst = it }),
+            CellCfg("续航", "km", "accent", { tvRange = it })
+        ))
+        root.addView(gap(6))
+
+        // ── 三列: 本次里程 / 行程时长 / 本次油费 ──
+        root.addView(tripleRow(
+            CellCfg("本次里程", "km", "value", { tvTripD = it }),
+            CellCfg("时长", "", "value", { tvTripT = it }),
+            CellCfg("本次油费", "元", "yellow", { tvTripC = it })
+        ))
+        root.addView(gap(6))
+
+        // ── 双列: 本日 / 本月 ──
+        root.addView(doubleRow("本日里程", "km", "本日油费", "元") { a, b -> tvDayD = a; tvDayC = b })
+        root.addView(gap(6))
+        root.addView(doubleRow("本月里程", "km", "本月油费", "元") { a, b -> tvMonD = a; tvMonC = b })
+
+        // ── 脚标 ──
+        root.addView(gap(8))
+        root.addView(label("v6.25.1  ·  YOUR_VPS_IP  ·  CarBridge", palette.textDim, 10f).apply { gravity = Gravity.CENTER })
+
+        scroll.addView(root)
+        setContentView(scroll)
+    }
+
+    // ====== 卡片组件 ======
+
+    private fun cardView() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+        tag = "card"
+        val gd = GradientDrawable().apply {
+            setColor(Color.parseColor(palette.card))
+            cornerRadius = dp(10).toFloat()
+            setStroke(dp(1), Color.parseColor(palette.cardStroke))
+        }
+        background = gd
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+    }
+
+    private fun label(t: String, color: String, size: Float) = TextView(this).apply {
+        text = t; setTextColor(Color.parseColor(color)); textSize = size
+        typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+        tag = "label"
+    }
+
+    private fun valueText(t: String, color: String, size: Float) = TextView(this).apply {
+        text = t; setTextColor(Color.parseColor(color)); textSize = size
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        tag = "value"
+    }
+
+    private fun unitText(t: String, color: String) = TextView(this).apply {
+        text = t; setTextColor(Color.parseColor(color)); textSize = 11f
+        typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+        tag = "unit"
+    }
+
+    private fun cell(label: String, unit: String, valueTag: String, bind: (TextView) -> Unit): View {
+        val cell = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        cell.addView(label(label, palette.textSec, 10f).apply { gravity = Gravity.CENTER })
+        cell.addView(gap(2))
+        val valTv = valueText("--", when(valueTag) {
+            "cyan" -> palette.cyan; "yellow" -> palette.yellow
+            "accent" -> palette.accent; else -> palette.textPri
+        }, 20f).apply {
+            tag = valueTag; gravity = Gravity.CENTER
+        }
+        cell.addView(valTv)
+        if (unit.isNotEmpty()) cell.addView(unitText(unit, palette.textDim).apply { gravity = Gravity.CENTER })
+        bind(valTv)
+        return cell
+    }
+
+    private fun tripleRow(c1: CellCfg, c2: CellCfg, c3: CellCfg): View {
+        val card = cardView().apply { setPadding(dp(6), dp(6), dp(6), dp(6)) }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(cell(c1.label, c1.unit, c1.valueTag, c1.bind))
+        row.addView(cell(c2.label, c2.unit, c2.valueTag, c2.bind))
+        row.addView(cell(c3.label, c3.unit, c3.valueTag, c3.bind))
+        card.addView(row)
+        return card
+    }
+
+    private fun doubleRow(l1: String, u1: String, l2: String, u2: String,
+                          bind: (TextView, TextView) -> Unit): View {
+        val card = cardView().apply { setPadding(dp(10), dp(8), dp(10), dp(8)) }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        var a: TextView? = null; var b: TextView? = null
+        row.addView(cell(l1, u1, "value") { a = it })
+        row.addView(cell(l2, u2, "yellow") { b = it })
+        card.addView(row)
+        bind(a!!, b!!)
+        return card
+    }
+
+    private fun spacer(w: Int, weight: Float) = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(if (w > 0) dp(w) else 0, LinearLayout.LayoutParams.WRAP_CONTENT, weight)
+    }
+
+    private fun gap(h: Int) = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(h))
+    }
+
+    // ====== 数据轮询 200ms ======
+
+    // 旧请求取消: 车库出来后堆积请求会集中返回，新请求发起时断开旧的
+    @Volatile private var pendingConn: HttpURLConnection? = null
+
+    private fun startPolling() {
+        handler.postDelayed(object : Runnable {
+            override fun run() {
+                if (!polling) return
+                httpThread.execute { fetchAndRefresh() }
+                handler.postDelayed(this, 200L)
+            }
+        }, 200L)
+    }
+
+    private fun fetchAndRefresh() {
+        // 断开上一轮未完成的连接（地下车库断网后堆积，新请求立即取消旧的）
+        pendingConn?.let {
+            try { it.disconnect() } catch (_: Exception) {}
+        }
+        try {
+            val conn = URL("http://YOUR_VPS_IP:8899/api/query/state").openConnection() as HttpURLConnection
+            conn.connectTimeout = 2000; conn.readTimeout = 2000
+            pendingConn = conn
+            if (conn.responseCode != 200) { conn.disconnect(); pendingConn = null; return }
+            val body = conn.inputStream.bufferedReader().readText(); conn.disconnect(); pendingConn = null
+            val j = JSONObject(body)
+
+            val rpm = j.optDouble("engineRpm", -1.0)
+            val spd = j.optDouble("obdSpeed", 0.0)
+            val cool = j.optDouble("coolantTemp", -1.0)
+            val load = j.opt("engineLoad")?.let { (it as? Number)?.toDouble() } ?: -1.0
+            val fuelLvl = j.optDouble("fuelLevel", 0.0)
+            val fuelInst = j.opt("fuelPer100km")?.let { (it as? Number)?.toDouble() }
+            val range = j.opt("remainingRange")?.let { (it as? Number)?.toInt() }
+            val tripD = j.optDouble("tripDistanceKm", 0.0)
+            val tripT = j.optString("tripDuration", "--")
+            val tripC = j.optDouble("tripFuelCost", 0.0)
+            val dayD = j.optDouble("dailyDistanceKm", 0.0)
+            val dayC = j.optDouble("dailyFuelCost", 0.0)
+            val monD = j.optDouble("monthlyDistanceKm", 0.0)
+            val monC = j.optDouble("monthlyFuelCost", 0.0)
+            val inTrip = j.optBoolean("inTrip", false)
+            val isNight = j.optBoolean("isNight", lastMode)
+            vpsIsNight = isNight
+
+            val status = when {
+                inTrip -> "● 行驶中"
+                rpm > 0 -> "● ${rpm.toInt()} rpm"
+                else -> "○ 等待"
+            }
+            val cal = Calendar.getInstance()
+            val dateTimeStr = String.format("%04d-%02d-%02d %02d:%02d:%02d",
+                cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH),
+                cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE), cal.get(Calendar.SECOND))
+            val lunarStr = lunarDate(cal)
+
+            handler.post {
+                // P0修复: Activity已销毁时放弃UI更新
+                if (isFinishing || isDestroyed) return@post
+                tvDateTime.text = dateTimeStr
+                tvLunar.text = lunarStr
+                if (status != tvStatus.text) tvStatus.text = status
+                if (spd >= 0) tvSpeed.text = if (spd > 0) spd.toInt().toString() else "0"
+                if (rpm >= 0) tvRpm.text = rpm.toInt().toString()
+                if (cool >= 0) tvCoolant.text = cool.toInt().toString()
+                if (load >= 0) tvLoad.text = "%.0f".format(load)
+                tvFuelLvl.text = "%.0f".format(fuelLvl)
+                tvFuelInst.text = if (fuelInst != null && fuelInst > 0) "%.1f".format(fuelInst) else "--"
+                tvRange.text = range?.toString() ?: "--"
+                tvTripD.text = "%.1f".format(tripD)
+                tvTripT.text = tripT
+                tvTripC.text = "%.1f".format(tripC)
+                tvDayD.text = "%.1f".format(dayD)
+                tvDayC.text = "%.1f".format(dayC)
+                tvMonD.text = "%.1f".format(monD)
+                tvMonC.text = "%.1f".format(monC)
+            }
+        } catch (_: Exception) { pendingConn = null }
+    }
+
+    // ====== 权限 ======
+
+    private fun requestPermissions() {
+        val perms = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED)
+            perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (perms.isNotEmpty()) ActivityCompat.requestPermissions(this, perms.toTypedArray(), 1001)
+    }
+
+    private fun createNotifyChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel("caragent_channel", "车机助手", NotificationManager.IMPORTANCE_LOW))
+    }
+
+    private fun dp(v: Int) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
+}
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/java/com/carbridge/agent/CarAgentService.kt
+──────────────────────────────────────────────────────────
+package com.carbridge.agent
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.location.Criteria
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.preference.PreferenceManager
+import java.util.concurrent.Executors
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedReader  // unused now
+import java.io.File
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.UUID  // unused now
+import java.util.concurrent.ConcurrentLinkedQueue
+
+class CarAgentService : Service() {
+
+    companion object {
+        private const val TAG = "CarAgent"
+        private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID = "caragent_channel"
+        @Volatile var isRunning = false
+            private set
+
+        // Public for MainActivity dashboard (all @Volatile: written on main thread, read on HTTP thread)
+        @Volatile var currentSpeedKmh = 0f
+            private set
+        @Volatile var currentHeading = "--"
+            private set
+        @Volatile var currentLat = 0.0
+            private set
+        @Volatile var currentLng = 0.0
+            private set
+        @Volatile var altitude = 0.0
+            private set
+        @Volatile var satCount = 0
+            private set
+        @Volatile var tripActive = false
+        @Volatile var tripStarted = false
+        @Volatile var tripStartedAt: Long = 0L
+            private set
+        @Volatile var tripElapsedMs = 0L
+            private set
+
+        // v6.0 仪表盘 10 项 (全部由 VPS /api/query/state 下发)
+        @Volatile var fuelPer100km: Float? = null    // L/100km
+        @Volatile var fuelLevel: Float? = null        // %
+        @Volatile var remainingRange: Int? = null     // 续航里程 km
+        @Volatile var tripDistanceKm: Double = 0.0    // 本次里程 km
+            private set
+        @Volatile var tripDuration: String = "--"     // 行程时长 (hhH mmmin)
+        @Volatile var tripFuelCost: Double = 0.0      // 本次油费 元
+        @Volatile var dailyDistKm: Double = 0.0       // 本日里程 km
+        @Volatile var dailyFuelCost: Double = 0.0     // 本日油费 元
+        @Volatile var monthlyDistKm: Double = 0.0     // 本月里程 km
+        @Volatile var monthlyFuelCost: Double = 0.0   // 本月油费 元
+
+        // OBD 连接状态
+        @Volatile var obdConnectionState = "⏳ 等待数据"
+            private set
+        @Volatile var lastObdFetchTime: Long = 0
+        @Volatile var obdLostSince: Long = 0
+            private set
+        @Volatile var lastObdFetchError: String? = null
+            private set
+        @Volatile var carNotifyTitle: String? = null
+        @Volatile var carNotifyMsg: String? = null
+        @Volatile var carNotifyTime: Long = 0L
+        @Volatile var _vpsInTrip = false
+        @Volatile var _vpsTripStartedAt: Long = 0L
+        fun consumeCarNotify(): Pair<String, String>? {
+            val title = carNotifyTitle; val msg = carNotifyMsg
+            if (title != null && msg != null) { carNotifyTitle = null; carNotifyMsg = null; return Pair(title, msg) }
+            return null
+        }
+
+        private const val FATIGUE_ALERT_MS = 2 * 60 * 60 * 1000L
+
+        private val obdFetchExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "ObdFetch").also { it.isDaemon = true }
+        }
+        @Volatile var isFetchingObd = false  // 防堆积：上一次未拉完则跳过本轮
+
+        @JvmStatic
+            fun fetchObdFromRelayStatic(serverUrl: String, apiKey: String) {
+            if (isFetchingObd) return
+            isFetchingObd = true
+            obdFetchExecutor.execute {
+                try {
+                    val urlStr = "$serverUrl/api/query/state?key=$apiKey"
+                    val conn = URL(urlStr).openConnection() as HttpURLConnection
+                    conn.connectTimeout = 5000; conn.readTimeout = 5000
+                    val code = conn.responseCode
+                    if (code == 200) {
+                        val body = conn.inputStream.bufferedReader().readText()
+                        conn.disconnect()
+                        val j = org.json.JSONObject(body)
+                        // v6.0: 10项仪表盘数据 + 行程状态
+                        var changed = false
+                        if (j.has("fuelPer100km") && !j.isNull("fuelPer100km")) { val v = j.getDouble("fuelPer100km").toFloat(); if (fuelPer100km != v) changed = true; fuelPer100km = v }
+                        if (j.has("fuelLevel") && !j.isNull("fuelLevel")) { val v = j.getDouble("fuelLevel").toFloat(); if (fuelLevel != v) changed = true; fuelLevel = v }
+                        if (j.has("remainingRange") && !j.isNull("remainingRange")) { remainingRange = j.getInt("remainingRange") }
+                        if (j.has("tripDistanceKm") && !j.isNull("tripDistanceKm")) { tripDistanceKm = j.getDouble("tripDistanceKm") }
+                        if (j.has("tripDuration") && !j.isNull("tripDuration")) { tripDuration = j.getString("tripDuration") }
+                        if (j.has("tripFuelCost") && !j.isNull("tripFuelCost")) { tripFuelCost = j.getDouble("tripFuelCost") }
+                        if (j.has("dailyDistanceKm") && !j.isNull("dailyDistanceKm")) { dailyDistKm = j.getDouble("dailyDistanceKm") }
+                        if (j.has("dailyFuelCost") && !j.isNull("dailyFuelCost")) { dailyFuelCost = j.getDouble("dailyFuelCost") }
+                        if (j.has("monthlyDistanceKm") && !j.isNull("monthlyDistanceKm")) { monthlyDistKm = j.getDouble("monthlyDistanceKm") }
+                        if (j.has("monthlyFuelCost") && !j.isNull("monthlyFuelCost")) { monthlyFuelCost = j.getDouble("monthlyFuelCost") }
+                        if (j.has("carNotify") && !j.isNull("carNotify")) {
+                            val cn = j.getJSONObject("carNotify")
+                            carNotifyTitle = cn.optString("title", null)
+                            carNotifyMsg = cn.optString("msg", null)
+                            carNotifyTime = cn.optLong("time", System.currentTimeMillis())
+                        }
+                        lastObdFetchTime = System.currentTimeMillis()
+                        lastObdFetchError = null
+                        obdConnectionState = "🟢 已同步"
+                        obdLostSince = 0L
+                        _vpsInTrip = j.optBoolean("inTrip", false)
+                        _vpsTripStartedAt = j.optLong("tripStartedAt", 0L)
+                        if (changed) Log.d(TAG, "OBD刷新: ${fuelPer100km} L/100km ${fuelLevel}% 续航${remainingRange}km")
+                    } else {
+                        conn.disconnect()
+                        lastObdFetchError = "HTTP $code"
+                        obdConnectionState = "🔴 HTTP $code"
+                        Log.w(TAG, "OBD fetch HTTP $code")
+                    }
+                } catch (e: Exception) {
+                    lastObdFetchError = e.message ?: "unknown"
+                    obdConnectionState = "🔴 ${e.message?.take(30)}"
+                    Log.w(TAG, "OBD fetch fail: ${e.message}")
+                } finally { isFetchingObd = false }
+            }
+        }
+
+        // 车机日志缓冲（传VPS远程分析）
+        @Volatile @JvmField var carAgentLog = ""
+        private val carLogLock = Any()
+        @JvmStatic fun appendCarLog(msg: String) {
+            synchronized(carLogLock) {
+                val ts = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+                val lines = carAgentLog.split("\n").takeLast(50)
+                carAgentLog = (lines + "[$ts] $msg").joinToString("\n")
+            }
+        }
+    }
+
+    private lateinit var locationManager: LocationManager
+    private lateinit var prefs: SharedPreferences
+    private lateinit var prefsListener: SharedPreferences.OnSharedPreferenceChangeListener
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var reportRunnable: Runnable? = null
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    // 离线缓存队列 (url -> jsonBody -> seqId)
+    data class OfflineItem(val url: String, val body: String, val seqId: Long)
+    private val offlineQueue = ConcurrentLinkedQueue<OfflineItem>()
+    private val offlineQueueFile: File
+        get() = File(filesDir, "offline_queue.json")
+
+    // Trip state
+    private var fatigueAlerted = false
+
+    // Current data (internal)
+    private var currentSpeedMs = 0.0f
+    private var currentBearing = 0.0f
+
+    // OBD bluetooth — 已移至手机中继 App，车机不再直连
+
+    override fun onCreate() {
+        super.onCreate()
+        Log.d(TAG, "Service onCreate"); appendCarLog("Service onCreate")
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.d(TAG, "Service onStartCommand"); appendCarLog("onStartCommand")
+        isRunning = true
+
+        prefs = PreferenceManager.getDefaultSharedPreferences(this)
+
+        prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            restartReporting()
+            // OBD 已移至手机中继 App，不再本地连接
+        }
+        prefs.registerOnSharedPreferenceChangeListener(prefsListener)
+
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, buildNotification())
+
+        loadOfflineQueue()
+        registerNetworkCallback()
+        startLocationUpdates()
+        startPeriodicReporting()
+        startObdPolling()
+        // OBD 已移至手机中继 App
+
+        Log.i(TAG, "CarAgent Service fully started!"); appendCarLog("服务已启动")
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isRunning = false
+        prefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
+        stopPeriodicReporting()
+        stopObdPolling()
+        // P0修复: connectivityManager 是 nullable (?.) 已安全, locationManager 是 lateinit 需 isInitialized
+        networkCallback?.let { try { connectivityManager?.unregisterNetworkCallback(it) } catch (_: Exception) {} }
+        if (::locationManager.isInitialized) {
+            try { locationManager.removeUpdates(locationListener) } catch (_: Exception) {}
+        }
+        Log.d(TAG, "Service onDestroy"); appendCarLog("onDestroy")
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    // --- Notification ---
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "CarAgent",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "车辆追踪后台服务"
+        }
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(channel)
+    }
+
+    private fun buildNotification(): Notification {
+        val configIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, ConfigActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("CarAgent")
+            .setContentText("正在追踪")
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentIntent(configIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    // --- Location ---
+
+    private val locationListener = object : LocationListener {
+        override fun onLocationChanged(loc: Location) {
+            currentLat = loc.latitude
+            currentLng = loc.longitude
+            currentSpeedMs = loc.speed
+            currentBearing = loc.bearing
+            currentSpeedKmh = loc.speed * 3.6f
+            currentHeading = formatHeading(loc.bearing)
+            altitude = if (loc.hasAltitude()) loc.altitude else 0.0
+            loc.extras?.let { extras ->
+                satCount = extras.getInt("satellites", 0)
+            }
+            // 行程由手机中继判定
+        }
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+    }
+
+    private fun startLocationUpdates() {
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        try {
+            val criteria = Criteria().apply {
+                accuracy = Criteria.ACCURACY_FINE
+                powerRequirement = Criteria.POWER_HIGH
+            }
+            val provider = locationManager.getBestProvider(criteria, true)
+            if (provider != null) {
+                locationManager.requestLocationUpdates(provider, 5000L, 0f, locationListener, Looper.getMainLooper())
+            } else {
+                locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 5000L, 0f, locationListener, Looper.getMainLooper())
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "No location permission"); appendCarLog("[E]无定位权限")
+        }
+    }
+
+    // 行程由手机OBD中继判定(ECU响应→开始, ECU丢失→结束)
+    // 车机仅负责GPS展示和OBD轮询，不再本地判定行程
+
+    // --- Periodic Reporting ---
+
+    private fun startPeriodicReporting() {
+        stopPeriodicReporting()
+        val intervalMs = getReportIntervalMs()
+        reportRunnable = object : Runnable {
+            override fun run() {
+                sendStatusReport()
+                // 行程由手机中继判定，车机不再本地累加里程
+                updateNotification()
+                handler.postDelayed(this, intervalMs)
+            }
+        }
+        handler.postDelayed(reportRunnable!!, intervalMs)
+    }
+
+    private fun stopPeriodicReporting() {
+        reportRunnable?.let { handler.removeCallbacks(it) }
+        reportRunnable = null
+    }
+
+    private fun restartReporting() {
+        stopPeriodicReporting()
+        startPeriodicReporting()
+    }
+
+    // --- 独立 OBD 轮询 (200ms，与GPS上报脱钩) ---
+    // 行程判定由 VPS + 手机中继主责，车机只收集 GPS 并服从 VPS 权威状态
+    private var obdRunnable: Runnable? = null
+    private val OBD_POLL_MS = 500L
+
+    private fun startObdPolling() {
+        stopObdPolling()
+        obdRunnable = object : Runnable {
+            override fun run() {
+                fetchObdFromRelay()
+                // VPS 权威行程状态判定（异步 fetch 完成后 _vpsInTrip 已更新）
+                if (Companion._vpsInTrip && !Companion.tripStarted) {
+                    Companion.tripStarted = true
+                    Companion.tripStartedAt = if (Companion._vpsTripStartedAt > 0) Companion._vpsTripStartedAt else System.currentTimeMillis()
+                    Companion.tripActive = true
+                    Companion.tripElapsedMs = 0L
+                    Companion.tripDistanceKm = 0.0
+                    appendCarLog("行程开始(VPS判定)")
+                    Log.i(TAG, "Trip started by VPS!")
+                } else if (!Companion._vpsInTrip && Companion.tripStarted) {
+                    endTrip()
+                    appendCarLog("行程结束(VPS判定)")
+                    Log.i(TAG, "Trip ended by VPS")
+                }
+                handler.postDelayed(this, OBD_POLL_MS)
+            }
+        }
+        handler.post(obdRunnable!!)
+    }
+
+    private fun stopObdPolling() {
+        obdRunnable?.let { handler.removeCallbacks(it) }
+        obdRunnable = null
+    }
+
+    private fun getReportIntervalMs(): Long {
+        val seconds = try {
+            prefs.getString("report_interval", "30")?.toLong() ?: 30L
+        } catch (_: NumberFormatException) { 30L }
+        return seconds.coerceIn(5L, 300L) * 1000L
+    }
+
+    private fun endTrip() {
+        Companion._vpsInTrip = false  // 阻断 VPS 权威状态，防本轮/下轮 if 立马又开启行程
+        Companion.tripStarted = false
+        fatigueAlerted = false
+        Companion.tripActive = false
+        Companion.tripElapsedMs = 0L
+        Companion.tripDistanceKm = 0.0
+        Log.i(TAG, "Trip ended!"); appendCarLog("行程结束")
+        // 通知 VPS 行程结束 (手机中继可能先断, 车机兜底)
+        try {
+            val json = JSONObject().apply {
+                put("lat", currentLat); put("lng", currentLng)
+                put("fuelConsumption", 0.0); put("_source", "caragent-timeout")
+            }
+            httpPost("${getServerUrl()}/api/car/end?key=${getApiKey()}", json.toString())
+        } catch (_: Exception) {}
+    }
+
+    // --- HTTP Requests ---
+
+    // OBD数据拉取 —— 从VPS获取手机中继上报的实时OBD
+    private fun fetchObdFromRelay() {
+        fetchObdFromRelayStatic(getServerUrl(), getApiKey())
+    }
+
+    private fun sendStatusReport() {
+        val serverUrl = getServerUrl()
+        val apiKey = getApiKey()
+
+        val json = JSONObject().apply {
+            put("speed", (currentSpeedMs * 3.6).toInt())
+            put("lat", currentLat)
+            put("lng", currentLng)
+            put("engineOn", currentSpeedMs > 0f)
+            put("heading", formatHeading(currentBearing))
+            put("version", "6.18")
+            // tripDistanceKm 由 VPS 独立计算, 车机不重复上报
+            synchronized(carLogLock) { put("_log", carAgentLog) }
+        }
+
+
+        httpPost("$serverUrl/api/car/status?key=${apiKey}", json.toString())
+    }
+
+    private fun updateNotification() {
+        // P2修复: 服务正在销毁时不刷新通知
+        if (!isRunning) return
+        try {
+            val nm = getSystemService(NotificationManager::class.java) ?: return
+            val parts = mutableListOf<String>()
+            if (currentSpeedKmh > 0) parts.add("🚗${currentSpeedKmh.toInt()}km/h")
+            // v6.0: 电压不再由车机显示 (OBD中继负责)
+            if (Companion.tripActive && Companion.tripStartedAt > 0) {
+                val mins = (System.currentTimeMillis() - Companion.tripStartedAt) / 60000
+                if (mins > 0) parts.add("⏱${mins}min")
+            }
+            val text = if (parts.isNotEmpty()) parts.joinToString(" · ") else "正在追踪"
+            val configIntent = PendingIntent.getActivity(
+                this, 0,
+                Intent(this, ConfigActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("CarAgent")
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                .setContentIntent(configIntent)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+            nm.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) { Log.w(TAG, "updateNotification error: ${e.message}") }
+    }
+
+    // P1修复: 复用线程池替代每次 new Thread(), 防线程爆炸
+    private val httpExecutor = java.util.concurrent.Executors.newCachedThreadPool()
+
+    private fun httpPost(urlString: String, jsonBody: String, retries: Int = 3) {
+        httpExecutor.submit {
+            var lastError: Exception? = null
+            for (attempt in 1..retries) {
+                try {
+                    val url = URL(urlString)
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.doOutput = true
+                    conn.connectTimeout = 10000
+                    conn.readTimeout = 10000
+
+                    val writer = OutputStreamWriter(conn.outputStream)
+                    writer.write(jsonBody)
+                    writer.flush()
+                    writer.close()
+
+                    val responseCode = conn.responseCode
+                    if (responseCode in 200..299) {
+                        Log.d(TAG, "HTTP $responseCode OK (attempt $attempt)"); appendCarLog("HTTP OK")
+                        conn.disconnect()
+                        return@submit
+                    }
+                    Log.w(TAG, "HTTP $responseCode, retrying...")
+                    conn.disconnect()
+                } catch (e: Exception) {
+                    lastError = e
+                    Log.w(TAG, "HTTP error attempt $attempt: ${e.message}")
+                }
+                try { Thread.sleep(5000) } catch (_: InterruptedException) {}
+            }
+            Log.e(TAG, "HTTP failed after $retries attempts: ${lastError?.message}"); appendCarLog("[E]HTTP失败")
+            enqueueOffline(urlString, jsonBody)
+        }
+    }
+
+    // --- Offline Queue ---
+
+    // 所有离线队列文件操作需同步（flush/dequeue/load 多线程竞争）
+    private val offlineFileLock = Any()
+
+    private fun loadOfflineQueue() {
+        synchronized(offlineFileLock) {
+            try {
+                val f = offlineQueueFile
+                if (!f.exists()) return
+                val arr = JSONArray(f.readText())
+                for (i in 0 until arr.length()) {
+                    val item = arr.getJSONObject(i)
+                    offlineQueue.add(OfflineItem(item.getString("url"), item.getString("body"), item.optLong("seq", 0L)))
+                }
+                Log.i(TAG, "Loaded ${offlineQueue.size} offline items"); appendCarLog("离线队列${offlineQueue.size}条")
+                f.delete()
+            } catch (e: Exception) { Log.w(TAG, "Load offline queue error: ${e.message}") }
+        }
+    }
+
+    private fun saveOfflineQueue() {
+        synchronized(offlineFileLock) {
+            try {
+                val arr = JSONArray()
+                for (item in offlineQueue) {
+                    val obj = JSONObject().apply { put("url", item.url); put("body", item.body); put("seq", item.seqId) }
+                    arr.put(obj)
+                }
+                offlineQueueFile.writeText(arr.toString())
+            } catch (e: Exception) { Log.w(TAG, "Save offline queue error: ${e.message}") }
+        }
+    }
+
+    // reuseSeqId: 重试时传入原始 seqId，保持去重键不变，否则 retry count 重置
+    private fun enqueueOffline(url: String, body: String, reuseSeqId: Long? = null) {
+        if (offlineQueue.size < 200) {  // 最多缓存200条
+            val seqId = reuseSeqId ?: offlineSeq.incrementAndGet()
+            offlineQueue.add(OfflineItem(url, body, seqId))
+            saveOfflineQueue()
+            Log.i(TAG, "Offline queued #$seqId (${offlineQueue.size} items)")
+        }
+    }
+
+    // 串行重传，避免瞬间大量并发线程
+    @Volatile private var flushingOffline = false
+    private val offlineRetries = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val MAX_OFFLINE_RETRIES = 3
+    private val offlineSeq = java.util.concurrent.atomic.AtomicLong(0)  // 原子递增ID做去重键
+
+    private fun flushOfflineQueue() {
+        if (offlineQueue.isEmpty() || flushingOffline) return
+        flushingOffline = true
+        httpExecutor.submit {
+            try {
+                Log.i(TAG, "Flushing ${offlineQueue.size} offline items...")
+                var item = offlineQueue.poll()
+                while (item != null) {
+                    val (url, body, seqId) = item
+                    val dedupKey = "$url|$seqId"
+                    try {
+                        val conn = URL(url).openConnection() as HttpURLConnection
+                        conn.connectTimeout = 10_000
+                        conn.readTimeout = 10_000
+                        conn.doOutput = true
+                        conn.setRequestProperty("Content-Type", "application/json")
+                        conn.outputStream.use { it.write(body.toByteArray()) }
+                        val code = conn.responseCode
+                        conn.disconnect()
+                        if (code in 200..299) {
+                            offlineRetries.remove(dedupKey)
+                            Log.d(TAG, "Offline flushed OK")
+                        } else {
+                            val count = offlineRetries.merge(dedupKey, 1) { _, v -> v + 1 } ?: 1
+                            if (count < MAX_OFFLINE_RETRIES) {
+                                enqueueOffline(url, body, seqId)  // 传入原seqId保持去重键
+                            } else {
+                                offlineRetries.remove(dedupKey)
+                                Log.w(TAG, "Offline item discarded after $MAX_OFFLINE_RETRIES retries: HTTP $code")
+                            }
+                            break  // 服务器不可用，停止，等下次网络恢复
+                        }
+                    } catch (e: Exception) {
+                        val count = offlineRetries.merge(dedupKey, 1) { _, v -> v + 1 } ?: 1
+                        if (count < MAX_OFFLINE_RETRIES) {
+                            enqueueOffline(url, body, seqId)  // 传入原seqId保持去重键
+                        } else {
+                            offlineRetries.remove(dedupKey)
+                            Log.w(TAG, "Offline item discarded after $MAX_OFFLINE_RETRIES retries: ${e.message}")
+                        }
+                        break  // 网络不可用，停止
+                    }
+                    item = offlineQueue.poll()
+                }
+                saveOfflineQueue()
+            } finally { flushingOffline = false }
+        }
+    }
+
+    private fun registerNetworkCallback() {
+        try {
+            connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    Log.i(TAG, "Network available, flushing offline queue")
+                    flushOfflineQueue()
+                    // 网络恢复后立即上报一次
+                    sendStatusReport()
+                }
+            }
+            connectivityManager!!.registerNetworkCallback(
+                NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(),
+                cb
+            )
+            networkCallback = cb
+        } catch (e: Exception) { Log.w(TAG, "Network callback error: ${e.message}") }
+    }
+
+    // --- Helpers ---
+
+    private fun getServerUrl(): String {
+        return prefs.getString("server_url", "http://YOUR_VPS_IP:8899") ?: "http://YOUR_VPS_IP:8899"
+    }
+
+    private fun getApiKey(): String {
+        return prefs.getString("api_key", "YOUR_CARBRIDGE_API_KEY") ?: "YOUR_CARBRIDGE_API_KEY"
+    }
+
+    private fun formatHeading(bearing: Float): String {
+        return when {
+            bearing < 22.5f || bearing >= 337.5f -> "N"
+            bearing < 67.5f -> "NE"
+            bearing < 112.5f -> "E"
+            bearing < 157.5f -> "SE"
+            bearing < 202.5f -> "S"
+            bearing < 247.5f -> "SW"
+            bearing < 292.5f -> "W"
+            else -> "NW"
+        }
+    }
+
+}
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/java/com/carbridge/agent/BootReceiver.kt
+──────────────────────────────────────────────────────────
+package com.carbridge.agent
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.util.Log
+
+class BootReceiver : BroadcastReceiver() {
+
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+            Log.d("BootReceiver", "Boot completed, starting service...")
+            val i = Intent(context, CarAgentService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(i)
+            } else {
+                context.startService(i)
+            }
+        }
+    }
+}
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/java/com/carbridge/agent/ConfigActivity.kt
+──────────────────────────────────────────────────────────
+package com.carbridge.agent
+
+import android.content.res.Configuration
+import android.graphics.Typeface
+import android.os.Bundle
+import android.view.View
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
+import androidx.preference.PreferenceManager
+
+class ConfigActivity : AppCompatActivity() {
+
+    private var BG = 0xFF0A0E0A.toInt()
+    private var CARD = 0xFF0D150D.toInt()
+    private var TEXT_PRIMARY = 0xFF00FF41.toInt()
+    private var TEXT_SECONDARY = 0xFF00AA33.toInt()
+    private var TEXT_DIM = 0xFF00661F.toInt()
+    private var BTN_BG = 0xFF00FF41.toInt()
+    private var BTN_TEXT = 0xFF0A0E0A.toInt()
+    private var EDIT_BG = 0  // set by pickColors()
+    private var EDIT_TEXT = 0xFFCCFFCC.toInt()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_config)
+        pickColors()
+        styleAll()
+        loadPrefs()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        pickColors()
+        styleAll()
+    }
+
+    private fun pickColors() {
+        val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        if (night) {
+            BG = 0xFF0A0E0A.toInt(); CARD = 0xFF0D150D.toInt()
+            TEXT_PRIMARY = 0xFF00FF41.toInt(); TEXT_SECONDARY = 0xFF00AA33.toInt()
+            TEXT_DIM = 0xFF00661F.toInt(); BTN_BG = 0xFF00FF41.toInt(); BTN_TEXT = 0xFF0A0E0A.toInt()
+            EDIT_BG = 0xFF1A2A1A.toInt(); EDIT_TEXT = 0xFFCCFFCC.toInt()
+        } else {
+            BG = 0xFFFAFAFA.toInt(); CARD = 0xFFFFFFFF.toInt()
+            TEXT_PRIMARY = 0xFF1B5E20.toInt(); TEXT_SECONDARY = 0xFF388E3C.toInt()
+            TEXT_DIM = 0xFF4CAF50.toInt(); BTN_BG = 0xFF2E7D32.toInt(); BTN_TEXT = 0xFFFFFFFF.toInt()
+            EDIT_BG = 0xFFFFFFFF.toInt(); EDIT_TEXT = 0xFF1B5E20.toInt()
+        }
+    }
+
+    private fun styleAll() {
+        findViewById<ScrollView>(R.id.config_scroll).setBackgroundColor(BG)
+        findViewById<LinearLayout>(R.id.config_layout).setBackgroundColor(BG)
+
+        val labels = listOf(R.id.tv_config_title, R.id.tv_label_server, R.id.tv_label_key, R.id.tv_label_interval)
+        val edits = listOf(R.id.et_server_url, R.id.et_api_key, R.id.et_interval)
+
+        for (id in labels) {
+            val tv = findViewById<TextView>(id)
+            tv.setTextColor(TEXT_PRIMARY)
+            tv.typeface = Typeface.MONOSPACE
+            if (id == R.id.tv_config_title) tv.setTextColor(TEXT_SECONDARY)
+        }
+        for (id in edits) {
+            val et = findViewById<EditText>(id)
+            et.setTextColor(EDIT_TEXT)
+            et.setBackgroundColor(EDIT_BG)
+            et.typeface = Typeface.MONOSPACE
+            et.setHintTextColor(TEXT_DIM)
+        }
+
+        val btn = findViewById<Button>(R.id.btn_save)
+        btn.setTextColor(BTN_TEXT)
+        btn.setBackgroundColor(BTN_BG)
+        btn.textSize = 13f
+        btn.typeface = Typeface.MONOSPACE
+        btn.text = "[ 保存 ]"
+    }
+
+    private fun loadPrefs() {
+        val prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        findViewById<EditText>(R.id.et_server_url).setText(prefs.getString("server_url", "http://YOUR_VPS_IP:8899"))
+        findViewById<EditText>(R.id.et_api_key).setText(prefs.getString("api_key", "YOUR_CARBRIDGE_API_KEY"))
+        findViewById<EditText>(R.id.et_interval).setText(prefs.getString("report_interval", "30"))
+        findViewById<Button>(R.id.btn_save).setOnClickListener {
+            prefs.edit()
+                .putString("server_url", findViewById<EditText>(R.id.et_server_url).text.toString().trim())
+                .putString("api_key", findViewById<EditText>(R.id.et_api_key).text.toString().trim())
+                .putString("report_interval", findViewById<EditText>(R.id.et_interval).text.toString().trim())
+                .apply()
+            finish()
+        }
+    }
+}
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/res/values/strings.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CarAgent</string>
+    <string name="battery_note">提示：电量显示为设备电量，非车辆电瓶电压</string>
+    <string name="bg_location_hint">请在系统设置中开启"始终允许"位置权限</string>
+    <string name="btn_save">保存</string>
+    <string name="btn_settings">设置</string>
+    <string name="btn_stop">停止服务</string>
+    <string name="channel_desc">车辆追踪后台定位服务</string>
+    <string name="channel_name">CarAgent 后台服务</string>
+    <string name="config_title">设置</string>
+    <string name="pref_api_key_default">YOUR_CARBRIDGE_API_KEY</string>
+    <string name="pref_api_key_title">API 密钥</string>
+    <string name="pref_interval_default">30</string>
+    <string name="pref_interval_title">上报间隔（秒）</string>
+    <string name="pref_obd_mac_default"></string>
+    <string name="pref_obd_mac_title">OBD 蓝牙 MAC 地址</string>
+    <string name="pref_server_url_default">http://YOUR_VPS_IP:8899</string>
+    <string name="pref_server_url_title">服务器地址</string>
+    <string name="service_running">CarAgent 正在运行</string>
+    <string name="status_init">初始化中...</string>
+    <string name="status_running">服务正在运行</string>
+    <string name="status_starting">正在启动服务...</string>
+    <string name="status_stopped">服务已停止</string>
+</resources>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/res/values/themes.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 车机低版本兼容, 禁用 DayNight, 硬编码暗色 -->
+    <style name="Theme.CarBridge" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">#1A1C1E</item>
+        <item name="android:textColor">#E0E0E0</item>
+        <item name="colorPrimary">#4FC3F7</item>
+        <item name="colorAccent">#00FFAA</item>
+    </style>
+</resources>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/res/drawable/card_background.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <corners android:radius="24dp" />
+    <solid android:color="#2A2D30" />
+    <stroke android:width="1dp" android:color="#3A3D40" />
+</shape>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/res/drawable/status_badge.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <corners android:radius="12dp" />
+    <solid android:color="#2E7D32" />
+    <padding android:left="8dp" android:right="8dp" android:top="2dp" android:bottom="2dp" />
+</shape>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/res/drawable/badge_bg.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#0D1A00" />
+    <corners android:radius="2dp" />
+    <stroke android:width="1dp" android:color="@color/accent" />
+</shape>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/res/drawable/card_bg.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/cardBg" />
+    <corners android:radius="4dp" />
+    <stroke android:width="1dp" android:color="@color/cardBorder" />
+</shape>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/res/layout/activity_main.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<!-- CarAgent v6.19 — 云端下发布局引擎, APP纯画布 -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+ android:id="@+id/root_scroll"
+ android:layout_width="match_parent"
+ android:layout_height="match_parent"
+ android:background="#1A1C1E"
+ android:padding="12dp">
+
+ <LinearLayout
+  android:id="@+id/root_layout"
+  android:layout_width="match_parent"
+  android:layout_height="wrap_content"
+  android:orientation="vertical"
+  android:gravity="center">
+
+  <!-- 卡片容器 — 由 MainActivity 动态填充 -->
+
+  <!-- 按钮 (固定, 不依赖云端) -->
+  <LinearLayout
+   android:id="@+id/buttons_row"
+   android:layout_width="match_parent"
+   android:layout_height="wrap_content"
+   android:orientation="horizontal"
+   android:gravity="center"
+   android:layout_marginTop="8dp">
+
+   <Button android:id="@+id/btn_start"
+    android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1"
+    android:layout_marginStart="6dp" android:layout_marginEnd="6dp" android:text="启动"
+    android:textColor="#FFFFFF" android:textSize="14sp" android:backgroundTint="#2E7D32" />
+
+   <Button android:id="@+id/btn_stop"
+    android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1"
+    android:layout_marginStart="6dp" android:layout_marginEnd="6dp" android:text="停止"
+    android:textColor="#FFFFFF" android:textSize="14sp" android:backgroundTint="#C62828" />
+  </LinearLayout>
+
+  <TextView android:id="@+id/tv_footer"
+   android:layout_width="match_parent"
+   android:layout_height="wrap_content"
+   android:gravity="center"
+   android:text="v6.19"
+   android:textColor="#546E7A"
+   android:textSize="11sp"
+   android:typeface="monospace"
+   android:layout_marginTop="4dp" />
+
+ </LinearLayout>
+</ScrollView>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/caragent/res/layout/activity_config.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/config_scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:id="@+id/config_layout"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:id="@+id/tv_config_title"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="设置"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:id="@+id/tv_label_server"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="服务器地址"
+            android:textSize="14sp"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/et_server_url"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textUri"
+            android:hint="http://YOUR_VPS_IP:8899"
+            android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:id="@+id/tv_label_key"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="API 密钥"
+            android:textSize="14sp"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/et_api_key"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="text"
+            android:hint="YOUR_CARBRIDGE_API_KEY"
+            android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:id="@+id/tv_label_interval"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="上报间隔（秒）"
+            android:textSize="14sp"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/et_interval"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="number"
+            android:hint="30"
+            android:layout_marginBottom="16dp" />
+
+        <Button
+            android:id="@+id/btn_save"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="保存" />
+
+    </LinearLayout>
+</ScrollView>
+
+
+═══════════════════════════════════════════════════════════════
+四、ObdRelay 手机端
+═══════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/obdrelay/AndroidManifest.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 网络 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- 前台服务 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <!-- 通知 (Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 蓝牙 -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+
+    <application android:usesCleartextTraffic="true"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="OBD中继"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.CarAgent">
+
+        <activity
+            android:name="com.carbridge.obd.MainActivity"
+            android:exported="true"
+            android:label="OBD中继">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name="com.carbridge.obd.ObdRelayService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+    </application>
+</manifest>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/obdrelay/java/com/carbridge/obd/ObdRelayService.kt
+──────────────────────────────────────────────────────────
+package com.carbridge.obd
+
+// ObdRelay v3.0 — OBD蓝牙中继服务 (纯后台, 零UI)
+// 连接 ELM327 → 逐PID读取 → 逐条异步上报 VPS
+// MAC/服务器/密钥 硬编码, 免配置
+
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothSocket
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.IBinder
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import org.json.JSONObject
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.UUID
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+class ObdRelayService : Service() {
+
+    companion object {
+        const val TAG = "ObdRelay"
+        const val NOTIFICATION_ID = 2001
+        const val CHANNEL_ID = "obd_relay_channel"
+
+        // 硬编码配置 (免配置)
+        const val OBD_MAC = "YOUR_ELM327_MAC_ADDRESS"
+        const val SERVER_URL = "http://YOUR_VPS_IP:8899"
+        const val API_KEY = "YOUR_CARBRIDGE_API_KEY"
+
+        // 轮询PID列表 — 启动时从云端拉取, 拉不到用本地16个兜底
+        // FULL_PID_LIST 必须在 PID_LIST 之前定义
+        private val FULL_PID_LIST = listOf(
+            0x0D,            // 车速
+            0x0C,            // 转速
+            0x04,            // 负荷
+            0x05,            // 水温
+            0x0B,            // 进气歧管压力 MAP
+            0x0F,            // 进气温度
+            0x10,            // 空气流量 MAF
+            0x11,            // 节气门位置
+            0x06,            // 短时燃油修正 STFT
+            0x07,            // 长时燃油修正 LTFT
+            0x0E,            // 点火提前角
+            0x33,            // 大气压力
+            0x42,            // 电瓶电压
+            0x43,            // 绝对负荷值
+            0x44,            // 空燃比当量
+            0x0A             // 燃油压力
+        )
+        private var PID_LIST = FULL_PID_LIST
+
+        @Volatile var isRunning = false
+        @Volatile var loopCount: Int = 0
+
+        private val SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+    }
+
+    private var obdThread: Thread? = null
+    private var httpExecutor: ExecutorService? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        // 有界队列: 网络断开时防止无界堆积 → OOM
+        val queue = java.util.concurrent.LinkedBlockingQueue<Runnable>(50)
+        httpExecutor = java.util.concurrent.ThreadPoolExecutor(
+            3, 3, 0L, java.util.concurrent.TimeUnit.MILLISECONDS, queue,
+            java.util.concurrent.ThreadPoolExecutor.DiscardPolicy()
+        )
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        try {
+            isRunning = true
+
+            // 检查蓝牙权限
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                    != PackageManager.PERMISSION_GRANTED) {
+                    Log.e(TAG, "蓝牙权限未授予, 停止服务")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+            }
+
+            createNotificationChannel()
+            // Android 14+ 必须显式 foregroundServiceType
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIFICATION_ID, buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(NOTIFICATION_ID, buildNotification())
+            }
+
+            obdThread?.interrupt()
+            try { obdThread?.join(2000) } catch (_: Exception) {}
+            obdThread = PollingThread()
+            obdThread?.start()
+
+            return START_STICKY
+        } catch (e: Exception) {
+            Log.e(TAG, "启动失败", e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+    }
+
+    @Volatile private var currentSocket: BluetoothSocket? = null
+
+    override fun onDestroy() {
+        isRunning = false
+        try { currentSocket?.close() } catch (_: Exception) {}
+        obdThread?.interrupt()
+        httpExecutor?.shutdown()
+        super.onDestroy()
+    }
+
+    private fun createNotificationChannel() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID, "OBD中继", NotificationManager.IMPORTANCE_LOW
+                ).apply { description = "OBD数据中继服务" }
+                val nm = getSystemService(NotificationManager::class.java)
+                nm.createNotificationChannel(channel)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "通知通道创建失败", e)
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        val configIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("OBD中继")
+            .setContentText("后台运行中")
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentIntent(configIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    // ========== 轮询线程 ==========
+
+    inner class PollingThread : Thread("OBD-Poller") {
+
+        private var socket: BluetoothSocket? = null
+        private var writer: OutputStreamWriter? = null
+
+        override fun run() {
+            while (isRunning) {
+                Log.i(TAG, "开始连接 $OBD_MAC ...")
+                try {
+                    connect()
+                    initialize()
+                    Log.i(TAG, "连接成功, 拉取云端PID配置...")
+                    fetchPidConfig()
+                    Log.i(TAG, "PID列表: ${PID_LIST.map { String.format("%02X",it) }}, 开始轮询")
+                    pollingLoop()
+                } catch (e: InterruptedException) {
+                    return
+                } catch (e: Exception) {
+                    Log.w(TAG, "异常: ${e.message}")
+                } finally {
+                    closeSocket()
+                }
+                if (isRunning) {
+                    try { Thread.sleep(10_000) } catch (_: InterruptedException) { return }
+                }
+            }
+        }
+
+        // ===== 蓝牙连接 (3种方式尝试, 避免闪退) =====
+
+        private fun connect() {
+            val adapter = BluetoothAdapter.getDefaultAdapter()
+                ?: throw RuntimeException("无蓝牙硬件")
+            if (!adapter.isEnabled) throw RuntimeException("蓝牙未开启")
+
+            // Android 12+ 运行时权限检查
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (this@ObdRelayService.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                    != PackageManager.PERMISSION_GRANTED) {
+                    throw RuntimeException("蓝牙CONNECT权限未授予")
+                }
+            }
+
+            val device = adapter.getRemoteDevice(OBD_MAC)
+            Log.i(TAG, "OBD设备: ${device.name ?: "未知"}")
+
+            var lastErr = ""
+
+            // 方法1: createRfcommSocketToServiceRecord (标准)
+            try {
+                socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+                    .also { currentSocket = it }
+                socket?.connect()
+                writer = OutputStreamWriter(socket!!.outputStream)
+                Log.i(TAG, "SPP连接成功")
+                return
+            } catch (e: Exception) {
+                lastErr = "SPP=${e.message?.take(30)}"
+                try { socket?.close() } catch (_: Exception) {}
+            }
+
+            // 方法2: createInsecureRfcommSocket
+            try {
+                socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+                    .also { currentSocket = it }
+                socket?.connect()
+                writer = OutputStreamWriter(socket!!.outputStream)
+                Log.i(TAG, "Insecure连接成功")
+                return
+            } catch (e: Exception) {
+                lastErr += " | Insecure=${e.message?.take(30)}"
+                try { socket?.close() } catch (_: Exception) {}
+            }
+
+            // 方法3: 反射 createRfcommSocket(int)
+            try {
+                val m = device.javaClass.getMethod("createRfcommSocket",
+                    Int::class.javaPrimitiveType)
+                for (ch in 1..30) {
+                    if (!isRunning) break
+                    try {
+                        socket = (m.invoke(device, ch) as BluetoothSocket)
+                            .also { currentSocket = it }
+                        socket?.connect()
+                        writer = OutputStreamWriter(socket!!.outputStream)
+                        Log.i(TAG, "反射通道 $ch 连接成功")
+                        return
+                    } catch (_: Exception) {
+                        try { socket?.close() } catch (_: Exception) {}
+                    }
+                }
+                lastErr += " | 反射1-30失败"
+            } catch (e: Exception) {
+                lastErr += " | 反射不可用: ${e.message?.take(20)}"
+            }
+
+            throw RuntimeException("蓝牙连接失败 ($lastErr)")
+        }
+
+        // ===== 初始化 ELM327 =====
+
+        private fun initialize() {
+            // 排空缓冲
+            try { while (socket?.inputStream?.available() ?: 0 > 0) socket?.inputStream?.read() } catch (_: Exception) {}
+
+            sendAt("AT Z", 4000)    // 复位
+            Thread.sleep(600)
+            sendAt("AT E0", 800)    // 关回显
+            sendAt("AT L0", 500)    // 关换行
+            sendAt("AT H0", 500)    // 关CAN头
+            sendAt("AT S0", 500)    // 关空格
+            sendAt("AT SP 5", 2000) // KWP2000 Fast
+            val ver = sendCommand("AT I", 1500)
+            if (ver.isNotBlank()) Log.i(TAG, "ELM327: $ver")
+            Log.i(TAG, "初始化完成")
+        }
+
+        private fun sendAt(cmd: String, waitMs: Long) {
+            val resp = sendCommand(cmd, waitMs)
+            val ok = resp.contains("OK", ignoreCase = true) || resp.isNotBlank()
+            if (!ok) Log.w(TAG, "AT $cmd 异常: $resp")
+        }
+
+        // ===== 命令发送 (收到 '>' 即返回, 无 BufferedReader) =====
+        // 经验教训: 绝对不能用 BufferedReader/InputStreamReader, 缓冲区吞数据 → 本地crash
+
+        private fun sendCommand(cmd: String, timeoutMs: Long): String {
+            try { while (socket?.inputStream?.available() ?: 0 > 0) socket?.inputStream?.read() } catch (_: Exception) {}
+            try { writer?.write("$cmd\r"); writer?.flush() } catch (_: Exception) { return "" }
+            val ins = socket?.inputStream ?: return ""
+            val deadline = System.currentTimeMillis() + timeoutMs
+            val sb = StringBuilder()
+            try {
+                while (System.currentTimeMillis() < deadline) {
+                    while (ins.available() > 0) {
+                        val b = ins.read()
+                        if (b < 0) return sb.toString().trim()
+                        val ch = b.toChar()
+                        if (ch == '>') return sb.toString().trim()
+                        if (ch == '\r' || ch == '\n') {
+                            if (sb.isNotEmpty() && sb.last() != '\n') sb.append('\n')
+                        } else if (ch.code >= 32) sb.append(ch)
+                    }
+                    Thread.sleep(10)
+                }
+            } catch (_: Exception) {}
+            return sb.toString().trim()
+        }
+
+        // ===== PID 轮询: 逐条读取 → 原样转发VPS (VPS负责解析+诊断) =====
+
+        private val logBuf = mutableListOf<String>()  // 手机端日志缓冲区
+
+        private fun appendLog(msg: String) {
+            synchronized(logBuf) { logBuf.add("${System.currentTimeMillis() % 100000} $msg"); if (logBuf.size > 30) logBuf.removeAt(0) }
+        }
+
+        private fun drainLog(): String = synchronized(logBuf) { val s = logBuf.joinToString("|"); logBuf.clear(); s }
+
+
+        // 启动时从 VPS 拉取 PID 配置, 拉不到用本地 FULL_PID_LIST 兜底
+        private fun fetchPidConfig() {
+            try {
+                val url = URL("$SERVER_URL/api/query/pid_config")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.connectTimeout = 5000; conn.readTimeout = 3000
+                if (conn.responseCode == 200) {
+                    val body = conn.inputStream.bufferedReader().readText()
+                    val arr = JSONObject(body).optJSONArray("pids") ?: return
+                    val list = mutableListOf<Int>()
+                    for (i in 0 until arr.length()) list.add(arr.getInt(i))
+                    if (list.isNotEmpty()) { PID_LIST = list; appendLog("云端PID:" + list.size + "个") }
+                }
+                conn.disconnect()
+            } catch (e: Exception) {
+                appendLog("PID拉取失败,用本地" + FULL_PID_LIST.size + "个")
+            }
+        }
+
+        private fun pollingLoop() {
+            var loop = 0
+            var consecutiveFails = 0
+            val executor = httpExecutor ?: return
+
+            appendLog("轮询启动 ${PID_LIST.size}PID")
+
+            while (isRunning && socket?.isConnected == true) {
+                var ecuResponded = false
+                for (pid in PID_LIST) {
+                    if (!isRunning) return
+                    val cmd = String.format("01 %02X", pid)
+                    val resp = sendCommand(cmd, 1500)
+                    if (resp.isBlank()) continue
+                    val errs = listOf("NO DATA", "SEARCHING", "ERROR", "UNABLE TO CONNECT", "CAN ERROR", "BUS INIT", "STOPPED")
+                    if (errs.any { resp.contains(it, ignoreCase = true) }) continue
+
+                    // 尝试提取 41XX 行 (有效数据)
+                    val pidPrefix = String.format("41%02X", pid)
+                    val hex = resp.lines()
+                        .map { it.trim().replace(" ", "").replace("\r", "") }
+                        .filter { it.startsWith(pidPrefix) && it.all { c -> c in "0123456789ABCDEFabcdef" } }
+                        .firstOrNull()
+
+                    val json = JSONObject()
+                    if (hex != null) {
+                        json.put("_type", "raw")
+                        json.put(String.format("%02X", pid), hex)
+                        ecuResponded = true
+                        consecutiveFails = 0
+                    } else {
+                        // 无 41XX 行: 把原始响应发 VPS 诊断
+                        if (loop % 5 == 0) {
+                            json.put("_type", "debug_raw")
+                            json.put("pid", pid)
+                            json.put("resp", resp.take(300))
+                            json.put("loop", loop)
+                        } else {
+                            continue  // 不发, 跳过
+                        }
+                    }
+
+                    // 附带手机端日志
+                    json.put("_log", drainLog())
+
+                    executor.submit {
+                        postFireAndForget("$SERVER_URL/api/car/obd?key=$API_KEY", json)
+                    }
+                }
+                loop++
+
+                if (!ecuResponded) {
+                    consecutiveFails++
+                    if (consecutiveFails > 30) {
+                        appendLog("ECU失联 loop=$loop")
+                        val json = JSONObject().apply {
+                            put("lat", 0.0); put("lng", 0.0)
+                            put("_source", "phone-obd")
+                            put("_log", drainLog())
+                        }
+                        httpFireAndForget("$SERVER_URL/api/car/end?key=$API_KEY", json)
+                        return
+                    }
+                }
+
+                Companion.loopCount = loop
+            }
+        }
+
+        // ===== HTTP 工具 =====
+
+        // 异步无返回值 POST (不阻塞轮询)
+        private fun postFireAndForget(urlStr: String, json: JSONObject) {
+            try {
+                val conn = URL(urlStr).openConnection() as HttpURLConnection
+                conn.connectTimeout = 5000
+                conn.readTimeout = 3000
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.outputStream.use { it.write(json.toString().toByteArray()) }
+                conn.responseCode
+                conn.disconnect()
+            } catch (e: Exception) {
+                // fire-and-forget: 失败不重试, 不影响下一PID
+            }
+        }
+
+        private fun httpFireAndForget(urlStr: String, json: JSONObject) {
+            val executor = httpExecutor ?: return
+            executor.submit {
+                try {
+                    val conn = URL(urlStr).openConnection() as HttpURLConnection
+                    conn.connectTimeout = 5000
+                    conn.readTimeout = 3000
+                    conn.doOutput = true
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.outputStream.use { it.write(json.toString().toByteArray()) }
+                    conn.responseCode
+                    conn.disconnect()
+                } catch (_: Exception) {}
+            }
+        }
+
+        // ===== 清理 =====
+
+        private fun closeSocket() {
+            try { writer?.close() } catch (_: Exception) {}
+            try { socket?.close() } catch (_: Exception) {}
+            socket = null; writer = null
+        }
+    }
+}
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/obdrelay/java/com/carbridge/obd/MainActivity.kt
+──────────────────────────────────────────────────────────
+// ObdRelay v3.0 — 极简界面: 启动服务 + 轮询计数
+package com.carbridge.obd
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.carbridge.agent.R
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class MainActivity : AppCompatActivity() {
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var refreshRunnable: Runnable? = null
+
+    private lateinit var tvStatus: TextView
+    private lateinit var tvLoopCount: TextView
+    private lateinit var tvLog: TextView
+
+    private val logLines = mutableListOf<String>()
+    private var lastLogText = ""
+    private var serviceStarted = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        tvStatus = findViewById(R.id.tv_status)
+        tvLoopCount = findViewById(R.id.tv_loop_count)
+        tvLog = findViewById(R.id.tv_log)
+
+        appendLog("OBD中继 v3.0 启动")
+        checkPermissionsAndStart()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        startUiRefresh()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        stopUiRefresh()
+    }
+
+    private fun checkPermissionsAndStart() {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED)
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)
+                != PackageManager.PERMISSION_GRANTED)
+                needed.add(Manifest.permission.BLUETOOTH_SCAN)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED)
+                needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (needed.isNotEmpty()) {
+            appendLog("请求权限: $needed")
+            ActivityCompat.requestPermissions(this, needed.toTypedArray(), 1001)
+        } else {
+            startObdService()
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) startObdService()
+    }
+
+    private fun startObdService() {
+        if (serviceStarted) return
+        serviceStarted = true
+        try {
+            val intent = Intent(this, ObdRelayService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            appendLog("中继服务已启动 ✓")
+        } catch (e: Exception) {
+            appendLog("❌ 启动失败: ${e.message}")
+        }
+    }
+
+    private fun startUiRefresh() {
+        stopUiRefresh()
+        refreshRunnable = object : Runnable {
+            override fun run() {
+                val running = ObdRelayService.isRunning
+                val loops = ObdRelayService.loopCount
+                tvStatus.text = ">> ${if (running) "后台运行中" else "未启动"}"
+                tvStatus.setTextColor(if (running) 0xFF00FF41.toInt() else 0xFFFFD600.toInt())
+                tvLoopCount.text = "已轮询 $loops 轮"
+                handler.postDelayed(this, 2000L)
+            }
+        }
+        handler.postDelayed(refreshRunnable!!, 500L)
+    }
+
+    private fun stopUiRefresh() {
+        refreshRunnable?.let { handler.removeCallbacks(it) }
+        refreshRunnable = null
+    }
+
+    private fun appendLog(line: String) {
+        val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        logLines.add("$ts  $line")
+        if (logLines.size > 40) logLines.removeAt(0)
+        val text = logLines.joinToString("\n")
+        if (text != lastLogText) {
+            tvLog.text = text
+            lastLogText = text
+        }
+    }
+}
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/obdrelay/res/values/strings.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OBD中继</string>
+    <string name="status_connecting">正在连接蓝牙...</string>
+    <string name="status_connected">已连接</string>
+    <string name="status_disconnected">蓝牙断开</string>
+    <string name="status_scanning">扫描设备中...</string>
+    <string name="label_elm">ELM327</string>
+    <string name="label_rpm">转速</string>
+    <string name="label_speed">车速</string>
+    <string name="label_temp">水温</string>
+    <string name="label_voltage">电压</string>
+    <string name="label_fuel">油量</string>
+    <string name="label_fuel_rate">瞬时油耗</string>
+    <string name="label_ecu">ECU</string>
+    <string name="label_pid">PID轮询</string>
+    <string name="label_vps">VPS上报</string>
+</resources>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/obdrelay/res/layout/activity_main.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<!-- OBD中继 v3.0 — 纯后台服务, 极简界面 -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0A0E0A"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:gravity="center">
+
+        <!-- 标题 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:padding="16dp"
+            android:layout_marginBottom="10dp"
+            android:background="@drawable/obd_card_bg">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="OBD 中继"
+                android:textColor="#4FC3F7"
+                android:textSize="20sp"
+                android:typeface="monospace" />
+
+            <TextView
+                android:id="@+id/tv_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text=">> 后台运行中"
+                android:textColor="#81C784"
+                android:textSize="14sp"
+                android:typeface="monospace" />
+
+            <TextView
+                android:id="@+id/tv_loop_count"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="已轮询 0 轮"
+                android:textColor="#546E7A"
+                android:textSize="12sp"
+                android:typeface="monospace" />
+        </LinearLayout>
+
+        <!-- 日志滚动区 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="12dp"
+            android:background="@drawable/obd_card_bg">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text=">> 日志"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp"
+                android:typeface="monospace"
+                android:layout_marginBottom="6dp" />
+
+            <ScrollView
+                android:layout_width="match_parent"
+                android:layout_height="160dp"
+                android:background="#050A05">
+
+                <TextView
+                    android:id="@+id/tv_log"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="等待服务启动..."
+                    android:textColor="#81C784"
+                    android:textSize="11sp"
+                    android:typeface="monospace"
+                    android:padding="8dp"
+                    android:lineSpacingExtra="2dp" />
+            </ScrollView>
+        </LinearLayout>
+
+        <!-- 脚注 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="OBD中继 :: YOUR_VPS_IP:8899"
+            android:textColor="#546E7A"
+            android:textSize="11sp"
+            android:typeface="monospace"
+            android:layout_marginTop="8dp" />
+
+    </LinearLayout>
+</ScrollView>
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/src/obdrelay/res/drawable/obd_card_bg.xml
+──────────────────────────────────────────────────────────
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="#0D150D" />
+    <stroke android:width="1dp" android:color="#1A3A1A" />
+    <corners android:radius="8dp" />
+</shape>
+
+
+═══════════════════════════════════════════════════════════════
+五、编译构建
+═══════════════════════════════════════════════════════════════
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/app/build.gradle.kts
+──────────────────────────────────────────────────────────
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.carbridge.agent"
+    compileSdk = 34
+
+    defaultConfig {
+        minSdk = 21
+        targetSdk = 34
+        versionCode = 3
+    }
+
+    flavorDimensions += "app"
+
+    productFlavors {
+        create("caragent") {
+            dimension = "app"
+            applicationId = "com.carbridge.agent"
+            versionName = "6.25.1"
+        }
+        create("obdrelay") {
+            dimension = "app"
+            applicationId = "com.carbridge.obd"
+            versionName = "2.9.0"
+        }
+    }
+
+    sourceSets {
+        getByName("caragent") {
+            java.srcDirs("src/caragent/java")
+            res.srcDirs("src/caragent/res")
+            manifest.srcFile("src/caragent/AndroidManifest.xml")
+        }
+        getByName("obdrelay") {
+            java.srcDirs("src/obdrelay/java")
+            res.srcDirs("src/obdrelay/res")
+            manifest.srcFile("src/obdrelay/AndroidManifest.xml")
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("YOUR_KEYSTORE_PATH/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
+    buildTypes {
+        debug {
+            versionNameSuffix = "-dev"
+        }
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.appcompat:appcompat:1.6.1")
+    implementation("androidx.preference:preference-ktx:1.2.1")
+}
+
+──────────────────────────────────────────────────────────
+文件: carbridge_app/build.gradle.kts
+──────────────────────────────────────────────────────────
+plugins {
+    id("com.android.application") version "8.2.0" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.20" apply false
+}
+──────────────────────────────────────────────────────────
+文件: carbridge_app/settings.gradle.kts
+──────────────────────────────────────────────────────────
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "CarAgent"
+include(":app")
+──────────────────────────────────────────────────────────
+文件: carbridge_app/gradle/wrapper/gradle-wrapper.properties
+──────────────────────────────────────────────────────────
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-8.5-bin.zip
+networkTimeout=10000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+═══════════════════════════════════════════════════════════════
+六、部署教程
+═══════════════════════════════════════════════════════════════
+
+VPS: cd carbridge && npm install → pm2 start ecosystem.config.js
+手机: 改 ObdRelayService.kt 三个 YOUR_ → ./gradlew assembleObdrelayRelease
+车机: 改 MainActivity.kt YOUR_VPS_IP → ./gradlew assembleCaragentRelease
+
+═══════════════════════════════════════════════════════════════
+七、API 接口
+═══════════════════════════════════════════════════════════════
+
+🔓 GET  /api/query/state      仪表盘10项
+🔓 GET  /api/query/pid_config  活跃PID
+🔒 POST /api/car/obd           手机推送raw hex (需key)
+🔒 POST /api/car/refuel        加油重置
+🔒 POST /api/car/calibration   油耗校准
+活跃PID: [0x0D,0x0C,0x04,0x05,0x10,0x43,0x0B,0x0F,0x06,0x07]
+
+═══════════════════════════════════════════════════════════════
+  CarBridge v6.25.1 | MIT License | 2026-06-22
+  所有敏感信息已替换为 YOUR_ 占位符，搜索 YOUR_ 即可配置
+═══════════════════════════════════════════════════════════════

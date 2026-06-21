@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 车机低版本兼容, 禁用 DayNight, 硬编码暗色 -->
+    <style name="Theme.CarBridge" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">#1A1C1E</item>
+        <item name="android:textColor">#E0E0E0</item>
+        <item name="colorPrimary">#4FC3F7</item>
+        <item name="colorAccent">#00FFAA</item>
+    </style>
+</resources>

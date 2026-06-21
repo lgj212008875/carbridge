@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">OBD中继</string>
+    <string name="status_connecting">正在连接蓝牙...</string>
+    <string name="status_connected">已连接</string>
+    <string name="status_disconnected">蓝牙断开</string>
+    <string name="status_scanning">扫描设备中...</string>
+    <string name="label_elm">ELM327</string>
+    <string name="label_rpm">转速</string>
+    <string name="label_speed">车速</string>
+    <string name="label_temp">水温</string>
+    <string name="label_voltage">电压</string>
+    <string name="label_fuel">油量</string>
+    <string name="label_fuel_rate">瞬时油耗</string>
+    <string name="label_ecu">ECU</string>
+    <string name="label_pid">PID轮询</string>
+    <string name="label_vps">VPS上报</string>
+</resources>

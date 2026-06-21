@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CarAgent</string>
+    <string name="battery_note">提示：电量显示为设备电量，非车辆电瓶电压</string>
+    <string name="bg_location_hint">请在系统设置中开启"始终允许"位置权限</string>
+    <string name="btn_save">保存</string>
+    <string name="btn_settings">设置</string>
+    <string name="btn_stop">停止服务</string>
+    <string name="channel_desc">车辆追踪后台定位服务</string>
+    <string name="channel_name">CarAgent 后台服务</string>
+    <string name="config_title">设置</string>
+    <string name="pref_api_key_default">YOUR_CARBRIDGE_API_KEY</string>
+    <string name="pref_api_key_title">API 密钥</string>
+    <string name="pref_interval_default">30</string>
+    <string name="pref_interval_title">上报间隔（秒）</string>
+    <string name="pref_obd_mac_default"></string>
+    <string name="pref_obd_mac_title">OBD 蓝牙 MAC 地址</string>
+    <string name="pref_server_url_default">http://YOUR_VPS_IP:8899</string>
+    <string name="pref_server_url_title">服务器地址</string>
+    <string name="service_running">CarAgent 正在运行</string>
+    <string name="status_init">初始化中...</string>
+    <string name="status_running">服务正在运行</string>
+    <string name="status_starting">正在启动服务...</string>
+    <string name="status_stopped">服务已停止</string>
+</resources>

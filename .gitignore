@@ -1,0 +1,21 @@
+# Build
+*/build/
+.gradle/
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+
+# Local config
+local.properties
+gradle.properties
+
+# Node
+node_modules/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

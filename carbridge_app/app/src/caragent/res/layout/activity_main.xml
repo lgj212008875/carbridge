@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- CarAgent v6.19 — 云端下发布局引擎, APP纯画布 -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+ android:id="@+id/root_scroll"
+ android:layout_width="match_parent"
+ android:layout_height="match_parent"
+ android:background="#1A1C1E"
+ android:padding="12dp">
+
+ <LinearLayout
+  android:id="@+id/root_layout"
+  android:layout_width="match_parent"
+  android:layout_height="wrap_content"
+  android:orientation="vertical"
+  android:gravity="center">
+
+  <!-- 卡片容器 — 由 MainActivity 动态填充 -->
+
+  <!-- 按钮 (固定, 不依赖云端) -->
+  <LinearLayout
+   android:id="@+id/buttons_row"
+   android:layout_width="match_parent"
+   android:layout_height="wrap_content"
+   android:orientation="horizontal"
+   android:gravity="center"
+   android:layout_marginTop="8dp">
+
+   <Button android:id="@+id/btn_start"
+    android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1"
+    android:layout_marginStart="6dp" android:layout_marginEnd="6dp" android:text="启动"
+    android:textColor="#FFFFFF" android:textSize="14sp" android:backgroundTint="#2E7D32" />
+
+   <Button android:id="@+id/btn_stop"
+    android:layout_width="0dp" android:layout_height="48dp" android:layout_weight="1"
+    android:layout_marginStart="6dp" android:layout_marginEnd="6dp" android:text="停止"
+    android:textColor="#FFFFFF" android:textSize="14sp" android:backgroundTint="#C62828" />
+  </LinearLayout>
+
+  <TextView android:id="@+id/tv_footer"
+   android:layout_width="match_parent"
+   android:layout_height="wrap_content"
+   android:gravity="center"
+   android:text="v6.19"
+   android:textColor="#546E7A"
+   android:textSize="11sp"
+   android:typeface="monospace"
+   android:layout_marginTop="4dp" />
+
+ </LinearLayout>
+</ScrollView>
